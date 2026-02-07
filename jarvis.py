@@ -17,6 +17,7 @@ import json
 import threading
 import signal
 import atexit
+import re
 from typing import Tuple, Optional
 
 # --- CONFIGURATION ---
@@ -101,13 +102,18 @@ PIPER_SPEAKER_ID = None  # Set for multi-speaker models, None for single-speaker
 _tts_voice = None
 
 def play_wav(wav_path: str) -> bool:
-    """Play a WAV file using aplay with a small buffer to avoid first-word cutoff."""
-    for device in ["plughw:2,0", "default"]:
+    """Play a WAV file through PipeWire/PulseAudio (prevents USB speaker first-word cutoff)."""
+    # paplay goes through the sound server, which keeps the USB device managed
+    # and buffers audio during SUSPENDED->RUNNING transitions.
+    # Falls back to aplay direct ALSA only if paplay is unavailable.
+    commands = [
+        ["paplay", wav_path],
+        ["aplay", "-q", "-D", "plughw:2,0", wav_path],
+        ["aplay", "-q", wav_path],
+    ]
+    for cmd in commands:
         try:
-            proc = subprocess.Popen(
-                ["aplay", "-q", "-D", device, "--buffer-time=20000", wav_path],
-                stderr=subprocess.PIPE
-            )
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
             active_processes.append(proc)
             proc.wait(timeout=60)
             if proc in active_processes:
@@ -120,6 +126,9 @@ def play_wav(wav_path: str) -> bool:
                 proc.wait()
             if proc in active_processes:
                 active_processes.remove(proc)
+        except FileNotFoundError:
+            # Command not installed, try next
+            continue
         except Exception:
             if proc in active_processes:
                 active_processes.remove(proc)
@@ -239,6 +248,20 @@ def transcribe(wav_file: str) -> str:
     except Exception as e:
         print(f"{BLUE}[ERROR]{RESET} Transcription failed: {e}")
         return ""
+
+
+def clean_transcription(text: str) -> str:
+    """
+    Remove whisper artifacts like [blank_audio], (silence), [MUSIC], etc.
+    Returns the cleaned text, or empty string if nothing real remains.
+    """
+    if not text:
+        return ""
+    # Strip bracketed and parenthesized whisper tags
+    cleaned = re.sub(r'\[.*?\]', '', text)
+    cleaned = re.sub(r'\(.*?\)', '', cleaned)
+    cleaned = cleaned.strip()
+    return cleaned
 
 
 def extract_command(text: str) -> Optional[str]:
@@ -363,9 +386,7 @@ def speak_text(text: str) -> bool:
     if not text or not text.strip():
         return False
     
-    raw_wav_path = "/dev/shm/jarvis_tts_raw.wav"
     wav_path = "/dev/shm/jarvis_tts.wav"
-    
     
     try:
         if _tts_voice is None:
@@ -377,20 +398,18 @@ def speak_text(text: str) -> bool:
         from piper.config import SynthesisConfig
         syn_config = SynthesisConfig(speaker_id=PIPER_SPEAKER_ID, volume=0.25)
         
-        # Generate speech (no "..." prefix -- we'll pad with real silence instead)
+        raw_wav_path = "/dev/shm/jarvis_tts_raw.wav"
         with wave.open(raw_wav_path, 'wb') as wav_file:
             _tts_voice.synthesize_wav(text, wav_file, syn_config=syn_config)
         
-        # Prepend 300ms of silence to the WAV so the USB speaker has time to wake up
-        # before any speech begins. This fixes the first-word cutoff issue.
-        SILENCE_MS = 300
+        # Prepend a small silence so the sound server has time to fully
+        # wake the USB sink before speech begins.
+        SILENCE_MS = 150
         with wave.open(raw_wav_path, 'rb') as rf:
             params = rf.getparams()
             audio_data = rf.readframes(rf.getnframes())
-        
         silence_samples = int(params.framerate * SILENCE_MS / 1000)
         silence_bytes = b'\x00' * (silence_samples * params.sampwidth * params.nchannels)
-        
         with wave.open(wav_path, 'wb') as wf:
             wf.setparams(params)
             wf.writeframes(silence_bytes + audio_data)
@@ -461,41 +480,9 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
-def play_ping_sound():
-    """Play a simple ping/beep sound to indicate listening."""
-    try:
-        # Generate a two-tone ping (880Hz + 1320Hz, 0.25 seconds)
-        sample_rate = 22050
-        duration = 0.25
-        num_samples = int(sample_rate * duration)
-        
-        audio_data = bytearray()
-        for i in range(num_samples):
-            t = i / sample_rate
-            # Two harmonics for a pleasant chime
-            tone = (math.sin(2 * math.pi * 880 * t) * 0.6 +
-                    math.sin(2 * math.pi * 1320 * t) * 0.4)
-            # Quick attack, smooth decay
-            envelope = min(1.0, t * 50) * math.exp(-t * 8)
-            sample = int(tone * envelope * 28000)
-            # Clamp to 16-bit range
-            sample = max(-32768, min(32767, sample))
-            # Pack as signed 16-bit little-endian
-            audio_data.extend(struct.pack('<h', sample))
-        
-        # Save as WAV and play
-        ping_wav = "/dev/shm/jarvis_ping.wav"
-        with wave.open(ping_wav, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(bytes(audio_data))
-        play_wav(ping_wav)
-    except Exception:
-        pass  # Ping is nice-to-have, not critical
 
 
-def record_until_silence(process, audio_buffer: collections.deque, silence_limit: float = None, play_ping: bool = True) -> list:
+def record_until_silence(process, audio_buffer: collections.deque, silence_limit: float = None) -> list:
     """
     Record audio until silence is detected.
     Returns list of audio chunks (mono).
@@ -509,10 +496,6 @@ def record_until_silence(process, audio_buffer: collections.deque, silence_limit
     
     # Add pre-audio buffer
     recording.extend(audio_buffer)
-    
-    # Play ping sound to indicate listening
-    if play_ping:
-        play_ping_sound()
     
     dbg(f"{BLUE}[RECORDING]{RESET} Listening...", end="", flush=True)
     
@@ -561,6 +544,27 @@ def drain_mic(process):
         pass
 
 
+def wait_for_silence(process, settle_time: float = 0.5):
+    """
+    After Jarvis finishes speaking, read and discard audio until the room
+    is quiet (RMS < THRESHOLD) for at least `settle_time` seconds.
+    This prevents the VAD from immediately triggering on speaker echo.
+    """
+    quiet_since = None
+    while True:
+        chunk = process.stdout.read(CHUNK * 2)
+        if not chunk:
+            return
+        rms = get_rms(chunk)
+        if rms < THRESHOLD:
+            if quiet_since is None:
+                quiet_since = time.time()
+            elif time.time() - quiet_since >= settle_time:
+                return  # Room is quiet, safe to start listening
+        else:
+            quiet_since = None  # Still noisy, keep discarding
+
+
 def send_to_ollama(command: str, process) -> Optional[str]:
     """
     Send a command to Ollama, speak the response.
@@ -588,8 +592,6 @@ def send_to_ollama(command: str, process) -> Optional[str]:
         # Speak response
         dbg(f"{MAGENTA}[SPEAKING]{RESET}...")
         speak_text(response_text)
-        # Drain mic buffer so we don't hear ourselves
-        drain_mic(process)
     
     return response_text
 
@@ -598,16 +600,16 @@ def conversation_loop(process):
     """
     Conversation mode: keep listening and responding until extended silence.
     No wake word needed after the first activation.
-    Uses VAD to detect speech, just like the main loop.
+    Uses the same VAD logic as the main loop -- waits patiently for RMS to
+    exceed the threshold before recording, then waits for silence to end the
+    utterance.  Exits only after CONVERSATION_TIMEOUT seconds of total silence.
     """
-    empty_count = 0
-    max_empty = 2  # Exit conversation after 2 consecutive empty inputs
     pre_audio = collections.deque(maxlen=int(RATE / CHUNK * PREV_AUDIO))
     
     while True:
         dbg(f"{YELLOW}[CONVERSATION]{RESET} Listening... (say nothing to exit)")
         
-        # Wait for speech using VAD
+        # --- Wait for speech (identical to main loop VAD) ---
         speech_chunks = []
         is_speaking = False
         silence_start = None
@@ -636,7 +638,7 @@ def conversation_loop(process):
                     # Speech ended
                     break
             else:
-                # No speech - check if we've been waiting too long
+                # No speech yet -- wait patiently up to CONVERSATION_TIMEOUT
                 if time.time() - wait_start >= CONVERSATION_TIMEOUT:
                     dbg(f"{BLUE}[INFO]{RESET} No input detected, exiting conversation mode.")
                     return
@@ -647,19 +649,17 @@ def conversation_loop(process):
         if not save_wav(speech_chunks, RAM_WAV):
             continue
         
+        # --- Transcribe and filter ---
         dbg(f"{YELLOW}[TRANSCRIBING]{RESET}...")
-        full_text = transcribe(RAM_WAV)
+        raw_text = transcribe(RAM_WAV)
+        full_text = clean_transcription(raw_text)
         
         if not full_text or len(full_text.strip()) < 2:
-            empty_count += 1
-            if empty_count >= max_empty:
-                dbg(f"{BLUE}[INFO]{RESET} No more input detected, exiting conversation mode.")
-                return
-            dbg(f"{BLUE}[...]{RESET} Didn't catch that, still listening...")
+            # Whisper returned silence/artifact -- NOT real speech.
+            # Don't count this against the user; just go back to waiting.
+            dbg(f"{BLUE}[...]{RESET} No speech detected, still listening...")
+            pre_audio.clear()
             continue
-        
-        # Got speech - reset empty counter
-        empty_count = 0
         
         # Remove wake word if user said it out of habit
         words = get_words(full_text)
@@ -676,6 +676,7 @@ def conversation_loop(process):
         
         send_to_ollama(full_command, process)
         pre_audio.clear()
+        wait_for_silence(process)
 
 
 def main():
@@ -807,7 +808,7 @@ def main():
                     
                     if save_wav(speech_chunks, RAM_WAV):
                         dbg(f"{YELLOW}[TRANSCRIBING]{RESET}...")
-                        text = transcribe(RAM_WAV)
+                        text = clean_transcription(transcribe(RAM_WAV))
                         
                         if text:
                             command = extract_command(text)
@@ -815,14 +816,15 @@ def main():
                             if command is not None:
                                 # "Jarvis" was in the sentence
                                 dbg(f"{GREEN}[WAKE WORD DETECTED]{RESET}")
-                                play_ping_sound()
                                 
                                 if len(command) >= 2:
                                     send_to_ollama(command, process)
                                 else:
                                     # Just said "Jarvis" with no command
                                     speak_text("Yes?")
-                                    drain_mic(process)
+                                
+                                # Let the room settle before listening again
+                                wait_for_silence(process)
                                 
                                 # Enter conversation mode
                                 dbg(f"{GREEN}[CONVERSATION MODE]{RESET} Keep talking, no need to say '{WAKE_WORD}'")
@@ -830,7 +832,7 @@ def main():
                                 
                                 # Back to wake word mode
                                 pre_audio.clear()
-                                drain_mic(process)
+                                wait_for_silence(process)
                                 
                                 dbg(f"{YELLOW}[LISTENING]{RESET} Say '{WAKE_WORD}' to activate...")
                     
