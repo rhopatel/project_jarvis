@@ -22,10 +22,9 @@ from typing import Tuple, Optional
 # --- CONFIGURATION ---
 WAKE_WORD = "Jarvis"
 SIMILARITY_THRESHOLD = 0.6  # Lowered from 0.7 for better detection
-WAKE_CHUNK_DURATION = 2.5  # seconds for wake word detection chunks
-WHISPER_THREADS = "1"
-THRESHOLD = 2000              # RMS threshold for VAD (may need adjustment based on mic)
-SILENCE_LIMIT = 3             # seconds of silence to stop recording
+WHISPER_THREADS = "4"
+THRESHOLD = 1000              # RMS threshold for VAD (may need adjustment based on mic)
+SILENCE_LIMIT = 2             # seconds of silence to stop recording
 PREV_AUDIO = 0.5              #kusal seconds of pre-audio buffer
 CONVERSATION_TIMEOUT = 30     # seconds of silence before exiting conversation mode
 PC_IP = "10.0.0.224"
@@ -48,9 +47,9 @@ if not os.path.exists(WHISPER_BIN):
         # Try relative to whisper.cpp directory
         WHISPER_BIN = "../whisper.cpp/build/bin/whisper-cli"
 
-WHISPER_MODEL = "models/ggml-base.en.bin"
+WHISPER_MODEL = "models/ggml-small.en-q4_0.bin"
 if not os.path.exists(WHISPER_MODEL):
-    WHISPER_MODEL = "../whisper.cpp/models/ggml-base.en.bin"
+    WHISPER_MODEL = "../whisper.cpp/models/ggml-small.en-q4_0.bin"
 
 # Set LD_LIBRARY_PATH for whisper shared libraries
 WHISPER_LIB_DIR = os.path.abspath("../whisper.cpp/build/src")
@@ -72,7 +71,6 @@ if lib_paths:
         os.environ["LD_LIBRARY_PATH"] = new_ld_path
 
 RAM_WAV = "/dev/shm/vad_capture.wav"
-WAKE_WAV = "/dev/shm/wake_chunk.wav"
 
 # --- CONSTANTS ---
 RATE = 16000
@@ -89,12 +87,64 @@ RESET = "\033[0m"
 
 # --- TTS CONFIGURATION ---
 # Piper TTS voice model - will be downloaded on first use if not present
-PIPER_VOICE_NAME = "en_US-kusal-medium"
+PIPER_VOICE_NAME = "en_US-ryan-medium"
 PIPER_VOICE_DIR = os.path.expanduser("~/.local/share/piper/voices")
 PIPER_SPEAKER_ID = None  # Set for multi-speaker models, None for single-speaker
 
 # Global: pre-loaded TTS voice (loaded once at startup)
 _tts_voice = None
+
+# Global: persistent aplay process (keeps USB audio device initialized)
+_aplay_proc = None
+_aplay_sample_rate = 22050
+
+
+def init_audio_output():
+    """Start a persistent aplay process to keep the USB audio device warm."""
+    global _aplay_proc, _aplay_sample_rate
+    
+    for device in ["plughw:2,0", "default"]:
+        try:
+            proc = subprocess.Popen(
+                ["aplay", "-q", "-D", device, "-f", "S16_LE",
+                 "-r", str(_aplay_sample_rate), "-c", "1",
+                 "--buffer-time=20000"],
+                stdin=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            time.sleep(0.2)
+            if proc.poll() is None:
+                _aplay_proc = proc
+                active_processes.append(proc)
+                # Send a tiny bit of silence to fully initialize
+                proc.stdin.write(b'\x00\x00' * int(_aplay_sample_rate * 0.1))
+                proc.stdin.flush()
+                print(f"{GREEN}[OK]{RESET} Audio output ready: {device} (buffer: 20ms)")
+                return True
+        except Exception:
+            continue
+    
+    print(f"{BLUE}[WARNING]{RESET} Could not open persistent audio output")
+    return False
+
+
+def play_audio(audio_data: bytes):
+    """Write raw PCM audio to the persistent aplay process."""
+    global _aplay_proc
+    
+    if _aplay_proc is None or _aplay_proc.poll() is not None:
+        # Restart if dead
+        if _aplay_proc and _aplay_proc in active_processes:
+            active_processes.remove(_aplay_proc)
+        init_audio_output()
+    
+    if _aplay_proc and _aplay_proc.poll() is None:
+        try:
+            _aplay_proc.stdin.write(audio_data)
+            _aplay_proc.stdin.flush()
+            return True
+        except BrokenPipeError:
+            return False
+    return False
 
 
 def similarity(s0: str, s1: str) -> float:
@@ -171,7 +221,7 @@ def transcribe(wav_file: str) -> str:
     
     cmd = [
         WHISPER_BIN, "-m", WHISPER_MODEL, "-f", wav_file,
-        "-ac", "512", "-t", WHISPER_THREADS, "--no-timestamps"
+        "-t", WHISPER_THREADS, "-bs", "1", "-bo", "1", "--no-timestamps"
     ]
     
     # Ensure LD_LIBRARY_PATH is set for subprocess
@@ -207,39 +257,35 @@ def transcribe(wav_file: str) -> str:
         return ""
 
 
-def detect_wake_word(audio_chunk: list) -> Tuple[bool, str]:
+def extract_command(text: str) -> Optional[str]:
     """
-    Detect wake word in audio chunk.
-    Returns (matched: bool, command_text: str)
+    Check if text contains the wake word 'Jarvis' and extract the command.
+    Returns the command text (with 'Jarvis' removed), or None if wake word not found.
     """
-    if not save_wav(audio_chunk, WAKE_WAV):
-        return False, ""
-    
-    text = transcribe(WAKE_WAV)
     if not text:
-        return False, ""
+        return None
     
     words = get_words(text)
     if not words:
-        return False, ""
+        return None
     
-    # Check if first word matches wake word
-    first_word = words[0] if words else ""
-    # Remove punctuation for better matching
-    first_word_clean = first_word.rstrip('.,!?;:')
-    sim = similarity(first_word_clean, WAKE_WORD)
+    # Check if any word matches "Jarvis"
+    jarvis_index = None
+    for i, word in enumerate(words):
+        clean_word = word.rstrip('.,!?;:')
+        if similarity(clean_word, WAKE_WORD) >= SIMILARITY_THRESHOLD:
+            jarvis_index = i
+            break
     
-    # Only print debug if similarity is close (to reduce noise)
-    if sim >= SIMILARITY_THRESHOLD - 0.2:
-        print(f"{BLUE}[DEBUG]{RESET} Heard: '{text}' -> First word: '{first_word_clean}', similarity: {sim:.2f}")
+    if jarvis_index is None:
+        return None
     
-    if sim >= SIMILARITY_THRESHOLD:
-        # Extract command (everything after wake word)
-        command_words = words[1:] if len(words) > 1 else []
-        command_text = " ".join(command_words)
-        return True, command_text
+    # Remove "Jarvis" and return the rest as the command
+    command_words = words[:jarvis_index] + words[jarvis_index + 1:]
+    command = " ".join(command_words).strip()
     
-    return False, ""
+    print(f"{BLUE}[DEBUG]{RESET} Heard: '{text}' -> Wake word found, command: '{command}'")
+    return command if len(command) >= 2 else ""
 
 
 def query_ollama_stream(prompt: str):
@@ -343,36 +389,23 @@ def speak_text(text: str) -> bool:
             raise RuntimeError("TTS voice not loaded")
         
         from piper.config import SynthesisConfig
-        syn_config = SynthesisConfig(speaker_id=PIPER_SPEAKER_ID, volume=0.5)
+        syn_config = SynthesisConfig(speaker_id=PIPER_SPEAKER_ID, volume=0.25)
         
         with wave.open(wav_path, 'wb') as wav_file:
             _tts_voice.synthesize_wav(text, wav_file, syn_config=syn_config)
         
-        # Play the WAV file with aplay
-        for aplay_device in ["plughw:2,0", "default"]:
-            try:
-                aplay_proc = subprocess.Popen(
-                    ["aplay", "-q", "-D", aplay_device, wav_path],
-                    stderr=subprocess.PIPE
-                )
-                active_processes.append(aplay_proc)
-                _, stderr = aplay_proc.communicate(timeout=30)
-                if aplay_proc in active_processes:
-                    active_processes.remove(aplay_proc)
-                if aplay_proc.returncode == 0:
-                    return True
-            except subprocess.TimeoutExpired:
-                if aplay_proc.poll() is None:
-                    aplay_proc.kill()
-                    aplay_proc.wait()
-                if aplay_proc in active_processes:
-                    active_processes.remove(aplay_proc)
-            except Exception:
-                if aplay_proc in active_processes:
-                    active_processes.remove(aplay_proc)
-                continue
+        # Read the generated audio data
+        with wave.open(wav_path, 'rb') as src:
+            audio_data = src.readframes(src.getnframes())
         
-        print(f"{BLUE}[ERROR]{RESET} All audio devices failed for TTS playback")
+        # Play through persistent audio device (already warm, no cutoff)
+        if play_audio(audio_data):
+            # Wait for audio to finish playing
+            duration = len(audio_data) / (2 * _aplay_sample_rate)  # 16-bit mono
+            time.sleep(duration + 0.1)
+            return True
+        
+        print(f"{BLUE}[ERROR]{RESET} Audio playback failed")
         return False
     
     except Exception as e:
@@ -445,19 +478,9 @@ def play_ping_sound():
             # Pack as signed 16-bit little-endian
             audio_data.extend(struct.pack('<h', sample))
         
-        # Play using aplay - try USB speaker first, then default
-        for aplay_device in ["plughw:2,0", "default"]:
-            try:
-                proc = subprocess.Popen(
-                    ["aplay", "-q", "-D", aplay_device, "-f", "S16_LE",
-                     "-r", str(sample_rate), "-c", "1"],
-                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                proc.communicate(input=bytes(audio_data), timeout=3)
-                if proc.returncode == 0:
-                    return
-            except Exception:
-                continue
+        # Play through persistent audio device
+        play_audio(bytes(audio_data))
+        time.sleep(duration + 0.05)
     except Exception:
         pass  # Ping is nice-to-have, not critical
 
@@ -526,46 +549,25 @@ def drain_mic(process):
         pass
 
 
-def process_command(process, audio_buffer):
+def send_to_ollama(command: str, process) -> Optional[str]:
     """
-    Record, transcribe, query Ollama, and speak a single command.
-    Returns the response text, or None if no valid command was captured.
+    Send a command to Ollama, speak the response.
+    Returns the response text, or None on failure.
     """
-    recording = record_until_silence(process, audio_buffer)
-    
-    if not save_wav(recording, RAM_WAV):
-        print(f"{BLUE}[ERROR]{RESET} Failed to save recording")
-        return None
-    
-    # Transcribe
-    print(f"{YELLOW}[TRANSCRIBING]{RESET}...")
-    full_text = transcribe(RAM_WAV)
-    
-    if not full_text:
-        print(f"{BLUE}[IGNORED]{RESET} No speech detected")
-        return None
-    
-    # Remove wake word from transcription if present
-    words = get_words(full_text)
-    if words and similarity(words[0], WAKE_WORD) >= SIMILARITY_THRESHOLD:
-        words = words[1:]
-    
-    full_command = " ".join(words) if words else full_text
-    
-    if len(full_command.strip()) < 2:
-        print(f"{BLUE}[IGNORED]{RESET} Too short")
-        return None
-    
-    print(f"{CYAN}YOU:{RESET} {full_command}")
+    print(f"{CYAN}YOU:{RESET} {command}")
     
     # Query Ollama
     print(f"{YELLOW}[THINKING]{RESET}...")
     response_text = ""
     
-    for token in query_ollama_stream(full_command):
-        if token is None:
-            break
-        response_text += token
+    try:
+        for token in query_ollama_stream(command):
+            if token is None:
+                break
+            response_text += token
+    except Exception as e:
+        print(f"{BLUE}[ERROR]{RESET} Failed to get response: {e}")
+        return None
     
     if response_text:
         print(f"{GREEN}JARVIS:{RESET} {response_text}")
@@ -581,21 +583,57 @@ def process_command(process, audio_buffer):
     return response_text
 
 
-def conversation_loop(process, audio_buffer):
+def conversation_loop(process):
     """
     Conversation mode: keep listening and responding until extended silence.
     No wake word needed after the first activation.
+    Uses VAD to detect speech, just like the main loop.
     """
     empty_count = 0
     max_empty = 2  # Exit conversation after 2 consecutive empty inputs
+    pre_audio = collections.deque(maxlen=int(RATE / CHUNK * PREV_AUDIO))
     
     while True:
-        print(f"{YELLOW}[CONVERSATION]{RESET} Listening... (say nothing for {CONVERSATION_TIMEOUT}s to exit)")
+        print(f"{YELLOW}[CONVERSATION]{RESET} Listening... (say nothing to exit)")
         
-        # Record with a longer silence limit to be patient
-        recording = record_until_silence(process, audio_buffer, play_ping=False)
+        # Wait for speech using VAD
+        speech_chunks = []
+        is_speaking = False
+        silence_start = None
+        wait_start = time.time()
         
-        if not save_wav(recording, RAM_WAV):
+        while True:
+            chunk = process.stdout.read(CHUNK * 2)
+            if not chunk:
+                return
+            
+            rms = get_rms(chunk)
+            pre_audio.append(chunk)
+            
+            if rms >= THRESHOLD:
+                if not is_speaking:
+                    is_speaking = True
+                    speech_chunks = list(pre_audio)
+                else:
+                    speech_chunks.append(chunk)
+                silence_start = None
+            elif is_speaking:
+                speech_chunks.append(chunk)
+                if silence_start is None:
+                    silence_start = time.time()
+                elif time.time() - silence_start >= SILENCE_LIMIT:
+                    # Speech ended
+                    break
+            else:
+                # No speech - check if we've been waiting too long
+                if time.time() - wait_start >= CONVERSATION_TIMEOUT:
+                    print(f"{BLUE}[INFO]{RESET} No input detected, exiting conversation mode.")
+                    return
+        
+        if not speech_chunks:
+            continue
+        
+        if not save_wav(speech_chunks, RAM_WAV):
             continue
         
         print(f"{YELLOW}[TRANSCRIBING]{RESET}...")
@@ -612,41 +650,21 @@ def conversation_loop(process, audio_buffer):
         # Got speech - reset empty counter
         empty_count = 0
         
-        # Remove wake word if user said it again out of habit
+        # Remove wake word if user said it out of habit
         words = get_words(full_text)
-        if words and similarity(words[0], WAKE_WORD) >= SIMILARITY_THRESHOLD:
-            words = words[1:]
+        command_words = []
+        for word in words:
+            clean = word.rstrip('.,!?;:')
+            if similarity(clean, WAKE_WORD) < SIMILARITY_THRESHOLD:
+                command_words.append(word)
         
-        full_command = " ".join(words) if words else full_text
+        full_command = " ".join(command_words).strip()
         
-        if len(full_command.strip()) < 2:
+        if len(full_command) < 2:
             continue
         
-        print(f"{CYAN}YOU:{RESET} {full_command}")
-        
-        # Query Ollama
-        print(f"{YELLOW}[THINKING]{RESET}...")
-        response_text = ""
-        
-        try:
-            for token in query_ollama_stream(full_command):
-                if token is None:
-                    break
-                response_text += token
-        except Exception as e:
-            print(f"{BLUE}[ERROR]{RESET} Failed to get response: {e}")
-            continue
-        
-        if response_text:
-            print(f"{GREEN}JARVIS:{RESET} {response_text}")
-            print()
-            print(f"{MAGENTA}[SPEAKING]{RESET}...")
-            speak_text(response_text)
-            # Drain mic buffer so we don't hear ourselves
-            drain_mic(process)
-            print()
-        
-        audio_buffer.clear()
+        send_to_ollama(full_command, process)
+        pre_audio.clear()
 
 
 def main():
@@ -679,6 +697,9 @@ def main():
     print(f"{BLUE}[INIT]{RESET} Loading TTS voice...")
     load_tts_voice()
     
+    # Initialize persistent audio output (keeps USB device warm)
+    init_audio_output()
+    
     # Start audio capture
     # Use plughw:4,0 for AIRHUG 21 microphone (card 4) - handles sample rate conversion
     record_cmd = [
@@ -703,70 +724,104 @@ def main():
             return
         else:
             print(f"{GREEN}[OK]{RESET} Using microphone: plughw:4,0 (AIRHUG 21)")
+            # Discard first ~1 second of audio (USB mic initialization spike)
+            discard_chunks = int(RATE / CHUNK * 1.0)
+            for _ in range(discard_chunks):
+                process.stdout.read(CHUNK * 2)
     except Exception as e:
         print(f"{BLUE}[ERROR]{RESET} Failed to start microphone: {e}")
         cleanup_processes()
         return
     
-    # Audio buffers
-    wake_buffer = collections.deque(maxlen=int(RATE / CHUNK * WAKE_CHUNK_DURATION))
-    audio_buffer = collections.deque(maxlen=int(RATE / CHUNK * PREV_AUDIO))
-    
-    wake_check_counter = 0
-    wake_check_interval = int(RATE / CHUNK * 0.5)  # Check every 0.5 seconds
+    # Audio buffer for pre-speech capture
+    pre_audio = collections.deque(maxlen=int(RATE / CHUNK * PREV_AUDIO))
     
     print(f"{YELLOW}[LISTENING]{RESET} Say '{WAKE_WORD}' to activate...")
-    print(f"{BLUE}[DEBUG]{RESET} Monitoring audio levels (threshold: {THRESHOLD})")
     print()
     
     try:
+        speech_chunks = []
+        is_speaking = False
+        silence_start = None
+        meter_counter = 0
+        METER_INTERVAL = int(RATE / CHUNK * 0.1)  # Update meter every ~100ms
+        METER_WIDTH = 40  # Character width of the bar
+        
         while True:
-            # Read chunk (mono, 16kHz from plughw device)
             chunk = process.stdout.read(CHUNK * 2)
             if not chunk:
                 print(f"{BLUE}[DEBUG]{RESET} No audio data received, exiting...")
                 break
             
             rms = get_rms(chunk)
+            pre_audio.append(chunk)
             
-            # Add to wake word detection buffer
-            wake_buffer.append(chunk)
-            audio_buffer.append(chunk)
-            wake_check_counter += 1
+            # Live RMS meter (updates ~10x per second, only when not speaking/processing)
+            meter_counter += 1
+            if not is_speaking and meter_counter >= METER_INTERVAL:
+                meter_counter = 0
+                bar_level = min(int(rms / 200), METER_WIDTH)  # Scale: 200 RMS per char
+                thresh_pos = min(int(THRESHOLD / 200), METER_WIDTH)
+                bar = ""
+                for i in range(METER_WIDTH):
+                    if i < bar_level:
+                        bar += "\033[1;32m#\033[0m" if i < thresh_pos else "\033[1;31m#\033[0m"
+                    elif i == thresh_pos:
+                        bar += "\033[1;33m|\033[0m"
+                    else:
+                        bar += " "
+                print(f"\r  RMS [{bar}] {rms:5.0f}/{THRESHOLD}", end="", flush=True)
             
-            # Check for wake word periodically (every 0.5 seconds) once buffer is full
-            if (len(wake_buffer) >= int(RATE / CHUNK * WAKE_CHUNK_DURATION) and 
-                wake_check_counter >= wake_check_interval):
-                wake_check_counter = 0
-                
-                # Process wake word detection chunk
-                wake_chunk = list(wake_buffer)
-                matched, command_text = detect_wake_word(wake_chunk)
-                
-                if matched:
-                    print(f"{GREEN}[WAKE WORD DETECTED]{RESET}")
+            if rms >= THRESHOLD:
+                # Voice detected
+                if not is_speaking:
+                    print()  # Clear meter line
+                    is_speaking = True
+                    speech_chunks = list(pre_audio)
+                else:
+                    speech_chunks.append(chunk)
+                silence_start = None
+            elif is_speaking:
+                # Below threshold but we were speaking - track silence
+                speech_chunks.append(chunk)
+                if silence_start is None:
+                    silence_start = time.time()
+                elif time.time() - silence_start >= SILENCE_LIMIT:
+                    # Speech ended - transcribe it
+                    is_speaking = False
+                    silence_start = None
                     
-                    try:
-                        # Process the first command (with ping sound)
-                        result = process_command(process, audio_buffer)
+                    if save_wav(speech_chunks, RAM_WAV):
+                        print(f"{YELLOW}[TRANSCRIBING]{RESET}...")
+                        text = transcribe(RAM_WAV)
                         
-                        if result:
-                            # Enter conversation mode - keep talking without wake word
-                            print(f"{GREEN}[CONVERSATION MODE]{RESET} Keep talking, no need to say '{WAKE_WORD}'")
-                            conversation_loop(process, audio_buffer)
-                        
-                    except Exception as e:
-                        print(f"{BLUE}[ERROR]{RESET} Error processing command: {e}")
-                        import traceback
-                        traceback.print_exc()
+                        if text:
+                            command = extract_command(text)
+                            
+                            if command is not None:
+                                # "Jarvis" was in the sentence
+                                print(f"{GREEN}[WAKE WORD DETECTED]{RESET}")
+                                play_ping_sound()
+                                
+                                if len(command) >= 2:
+                                    send_to_ollama(command, process)
+                                else:
+                                    # Just said "Jarvis" with no command
+                                    speak_text("Yes?")
+                                    drain_mic(process)
+                                
+                                # Enter conversation mode
+                                print(f"{GREEN}[CONVERSATION MODE]{RESET} Keep talking, no need to say '{WAKE_WORD}'")
+                                conversation_loop(process)
+                                
+                                # Back to wake word mode
+                                pre_audio.clear()
+                                drain_mic(process)
+                                
+                                print(f"\r{YELLOW}[LISTENING]{RESET} Say '{WAKE_WORD}' to activate...")
+                                print()
                     
-                    # Back to wake word mode
-                    wake_buffer.clear()
-                    audio_buffer.clear()
-                    wake_check_counter = 0
-                    
-                    print(f"{YELLOW}[LISTENING]{RESET} Say '{WAKE_WORD}' to activate...")
-                    print()
+                    speech_chunks = []
     
     except KeyboardInterrupt:
         print(f"\n{BLUE}[SHUTDOWN]{RESET} Stopping...")
