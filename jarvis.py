@@ -20,6 +20,7 @@ import atexit
 from typing import Tuple, Optional
 
 # --- CONFIGURATION ---
+DEBUG_MODE = 0                # 0 = clean output (only YOU/JARVIS), 1 = verbose debug
 WAKE_WORD = "Jarvis"
 SIMILARITY_THRESHOLD = 0.6  # Lowered from 0.7 for better detection
 WHISPER_THREADS = "4"
@@ -47,9 +48,9 @@ if not os.path.exists(WHISPER_BIN):
         # Try relative to whisper.cpp directory
         WHISPER_BIN = "../whisper.cpp/build/bin/whisper-cli"
 
-WHISPER_MODEL = "models/ggml-small.en-q4_0.bin"
+WHISPER_MODEL = "models/ggml-tiny.en.bin"
 if not os.path.exists(WHISPER_MODEL):
-    WHISPER_MODEL = "../whisper.cpp/models/ggml-small.en-q4_0.bin"
+    WHISPER_MODEL = "../whisper.cpp/models/ggml-tiny.en.bin"
 
 # Set LD_LIBRARY_PATH for whisper shared libraries
 WHISPER_LIB_DIR = os.path.abspath("../whisper.cpp/build/src")
@@ -85,6 +86,11 @@ CYAN = "\033[1;36m"
 MAGENTA = "\033[1;35m"
 RESET = "\033[0m"
 
+def dbg(*args, **kwargs):
+    """Print only when DEBUG_MODE is enabled."""
+    if DEBUG_MODE:
+        print(*args, **kwargs)
+
 # --- TTS CONFIGURATION ---
 # Piper TTS voice model - will be downloaded on first use if not present
 PIPER_VOICE_NAME = "en_US-ryan-medium"
@@ -94,56 +100,30 @@ PIPER_SPEAKER_ID = None  # Set for multi-speaker models, None for single-speaker
 # Global: pre-loaded TTS voice (loaded once at startup)
 _tts_voice = None
 
-# Global: persistent aplay process (keeps USB audio device initialized)
-_aplay_proc = None
-_aplay_sample_rate = 22050
-
-
-def init_audio_output():
-    """Start a persistent aplay process to keep the USB audio device warm."""
-    global _aplay_proc, _aplay_sample_rate
-    
+def play_wav(wav_path: str) -> bool:
+    """Play a WAV file using aplay with a small buffer to avoid first-word cutoff."""
     for device in ["plughw:2,0", "default"]:
         try:
             proc = subprocess.Popen(
-                ["aplay", "-q", "-D", device, "-f", "S16_LE",
-                 "-r", str(_aplay_sample_rate), "-c", "1",
-                 "--buffer-time=20000"],
-                stdin=subprocess.PIPE, stderr=subprocess.PIPE
+                ["aplay", "-q", "-D", device, "--buffer-time=20000", wav_path],
+                stderr=subprocess.PIPE
             )
-            time.sleep(0.2)
-            if proc.poll() is None:
-                _aplay_proc = proc
-                active_processes.append(proc)
-                # Send a tiny bit of silence to fully initialize
-                proc.stdin.write(b'\x00\x00' * int(_aplay_sample_rate * 0.1))
-                proc.stdin.flush()
-                print(f"{GREEN}[OK]{RESET} Audio output ready: {device} (buffer: 20ms)")
+            active_processes.append(proc)
+            proc.wait(timeout=60)
+            if proc in active_processes:
+                active_processes.remove(proc)
+            if proc.returncode == 0:
                 return True
+        except subprocess.TimeoutExpired:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            if proc in active_processes:
+                active_processes.remove(proc)
         except Exception:
+            if proc in active_processes:
+                active_processes.remove(proc)
             continue
-    
-    print(f"{BLUE}[WARNING]{RESET} Could not open persistent audio output")
-    return False
-
-
-def play_audio(audio_data: bytes):
-    """Write raw PCM audio to the persistent aplay process."""
-    global _aplay_proc
-    
-    if _aplay_proc is None or _aplay_proc.poll() is not None:
-        # Restart if dead
-        if _aplay_proc and _aplay_proc in active_processes:
-            active_processes.remove(_aplay_proc)
-        init_audio_output()
-    
-    if _aplay_proc and _aplay_proc.poll() is None:
-        try:
-            _aplay_proc.stdin.write(audio_data)
-            _aplay_proc.stdin.flush()
-            return True
-        except BrokenPipeError:
-            return False
     return False
 
 
@@ -221,7 +201,8 @@ def transcribe(wav_file: str) -> str:
     
     cmd = [
         WHISPER_BIN, "-m", WHISPER_MODEL, "-f", wav_file,
-        "-t", WHISPER_THREADS, "-bs", "1", "-bo", "1", "--no-timestamps"
+        "-t", WHISPER_THREADS, "-bs", "1", "-bo", "1",
+        "--no-timestamps", "-l", "en"
     ]
     
     # Ensure LD_LIBRARY_PATH is set for subprocess
@@ -241,13 +222,16 @@ def transcribe(wav_file: str) -> str:
             env["LD_LIBRARY_PATH"] = new_ld_path
     
     try:
+        t0 = time.time()
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+        elapsed = time.time() - t0
         
         if result.returncode != 0:
-            print(f"{BLUE}[DEBUG] Whisper error: {result.stderr[:200]}{RESET}")
+            dbg(f"{BLUE}[DEBUG] Whisper error: {result.stderr[:200]}{RESET}")
             return ""
         
         text = result.stdout.strip()
+        dbg(f"{BLUE}[PERF]{RESET} Transcription: {elapsed:.2f}s")
         return text
     except subprocess.TimeoutExpired:
         print(f"{BLUE}[ERROR]{RESET} Whisper transcription timed out")
@@ -284,7 +268,7 @@ def extract_command(text: str) -> Optional[str]:
     command_words = words[:jarvis_index] + words[jarvis_index + 1:]
     command = " ".join(command_words).strip()
     
-    print(f"{BLUE}[DEBUG]{RESET} Heard: '{text}' -> Wake word found, command: '{command}'")
+    dbg(f"{BLUE}[DEBUG]{RESET} Heard: '{text}' -> Wake word found, command: '{command}'")
     return command if len(command) >= 2 else ""
 
 
@@ -363,10 +347,10 @@ def load_tts_voice():
         
         _tts_voice = PiperVoice.load(str(model_path), use_cuda=False)
         
-        print(f"{GREEN}[OK]{RESET} TTS voice loaded: {PIPER_VOICE_NAME}")
+        dbg(f"{GREEN}[OK]{RESET} TTS voice loaded: {PIPER_VOICE_NAME}")
         return True
     except Exception as e:
-        print(f"{BLUE}[WARNING]{RESET} Failed to load TTS voice: {e}")
+        print(f"{BLUE}[WARNING]{RESET} Failed to load TTS voice: {e}")  # always show - TTS is critical
         return False
 
 
@@ -379,7 +363,9 @@ def speak_text(text: str) -> bool:
     if not text or not text.strip():
         return False
     
+    raw_wav_path = "/dev/shm/jarvis_tts_raw.wav"
     wav_path = "/dev/shm/jarvis_tts.wav"
+    
     
     try:
         if _tts_voice is None:
@@ -391,18 +377,35 @@ def speak_text(text: str) -> bool:
         from piper.config import SynthesisConfig
         syn_config = SynthesisConfig(speaker_id=PIPER_SPEAKER_ID, volume=0.25)
         
-        with wave.open(wav_path, 'wb') as wav_file:
+        # Generate speech (no "..." prefix -- we'll pad with real silence instead)
+        with wave.open(raw_wav_path, 'wb') as wav_file:
             _tts_voice.synthesize_wav(text, wav_file, syn_config=syn_config)
         
-        # Read the generated audio data
-        with wave.open(wav_path, 'rb') as src:
-            audio_data = src.readframes(src.getnframes())
+        # Prepend 300ms of silence to the WAV so the USB speaker has time to wake up
+        # before any speech begins. This fixes the first-word cutoff issue.
+        SILENCE_MS = 300
+        with wave.open(raw_wav_path, 'rb') as rf:
+            params = rf.getparams()
+            audio_data = rf.readframes(rf.getnframes())
         
-        # Play through persistent audio device (already warm, no cutoff)
-        if play_audio(audio_data):
-            # Wait for audio to finish playing
-            duration = len(audio_data) / (2 * _aplay_sample_rate)  # 16-bit mono
-            time.sleep(duration + 0.1)
+        silence_samples = int(params.framerate * SILENCE_MS / 1000)
+        silence_bytes = b'\x00' * (silence_samples * params.sampwidth * params.nchannels)
+        
+        with wave.open(wav_path, 'wb') as wf:
+            wf.setparams(params)
+            wf.writeframes(silence_bytes + audio_data)
+        
+        # Save persistent copy when debugging
+        if DEBUG_MODE:
+            import shutil
+            tts_debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_debug")
+            os.makedirs(tts_debug_dir, exist_ok=True)
+            debug_name = f"tts_{int(time.time())}.wav"
+            debug_path = os.path.join(tts_debug_dir, debug_name)
+            shutil.copy2(wav_path, debug_path)
+            dbg(f"{BLUE}[DEBUG]{RESET} TTS WAV saved: {debug_path}")
+        
+        if play_wav(wav_path):
             return True
         
         print(f"{BLUE}[ERROR]{RESET} Audio playback failed")
@@ -410,12 +413,13 @@ def speak_text(text: str) -> bool:
     
     except Exception as e:
         print(f"{BLUE}[ERROR]{RESET} TTS failed: {e}")
-        import traceback
-        traceback.print_exc()
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
     
     # Fallback: use espeak
     try:
-        print(f"{BLUE}[INFO]{RESET} Using espeak fallback")
+        dbg(f"{BLUE}[INFO]{RESET} Using espeak fallback")
         result = subprocess.run(
             ["espeak", "-s", "150", "-v", "en", text],
             stderr=subprocess.DEVNULL, timeout=30
@@ -451,7 +455,8 @@ def cleanup_processes():
 
 def signal_handler(signum, frame):
     """Handle termination signals."""
-    print(f"\n{BLUE}[SHUTDOWN]{RESET} Received signal {signum}, cleaning up...")
+    dbg(f"\n{BLUE}[SHUTDOWN]{RESET} Received signal {signum}, cleaning up...")
+    print()
     cleanup_processes()
     sys.exit(0)
 
@@ -478,9 +483,14 @@ def play_ping_sound():
             # Pack as signed 16-bit little-endian
             audio_data.extend(struct.pack('<h', sample))
         
-        # Play through persistent audio device
-        play_audio(bytes(audio_data))
-        time.sleep(duration + 0.05)
+        # Save as WAV and play
+        ping_wav = "/dev/shm/jarvis_ping.wav"
+        with wave.open(ping_wav, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(bytes(audio_data))
+        play_wav(ping_wav)
     except Exception:
         pass  # Ping is nice-to-have, not critical
 
@@ -504,7 +514,7 @@ def record_until_silence(process, audio_buffer: collections.deque, silence_limit
     if play_ping:
         play_ping_sound()
     
-    print(f"{BLUE}[RECORDING]{RESET} Listening...", end="", flush=True)
+    dbg(f"{BLUE}[RECORDING]{RESET} Listening...", end="", flush=True)
     
     while True:
         chunk = process.stdout.read(CHUNK * 2)
@@ -528,9 +538,11 @@ def record_until_silence(process, audio_buffer: collections.deque, silence_limit
                 break
         
         # Visual feedback
-        print(".", end="", flush=True)
+        if DEBUG_MODE:
+            print(".", end="", flush=True)
     
-    print()  # New line after dots
+    if DEBUG_MODE:
+        print()  # New line after dots
     return recording
 
 
@@ -557,7 +569,7 @@ def send_to_ollama(command: str, process) -> Optional[str]:
     print(f"{CYAN}YOU:{RESET} {command}")
     
     # Query Ollama
-    print(f"{YELLOW}[THINKING]{RESET}...")
+    dbg(f"{YELLOW}[THINKING]{RESET}...")
     response_text = ""
     
     try:
@@ -574,11 +586,10 @@ def send_to_ollama(command: str, process) -> Optional[str]:
         print()
         
         # Speak response
-        print(f"{MAGENTA}[SPEAKING]{RESET}...")
+        dbg(f"{MAGENTA}[SPEAKING]{RESET}...")
         speak_text(response_text)
         # Drain mic buffer so we don't hear ourselves
         drain_mic(process)
-        print()
     
     return response_text
 
@@ -594,7 +605,7 @@ def conversation_loop(process):
     pre_audio = collections.deque(maxlen=int(RATE / CHUNK * PREV_AUDIO))
     
     while True:
-        print(f"{YELLOW}[CONVERSATION]{RESET} Listening... (say nothing to exit)")
+        dbg(f"{YELLOW}[CONVERSATION]{RESET} Listening... (say nothing to exit)")
         
         # Wait for speech using VAD
         speech_chunks = []
@@ -627,7 +638,7 @@ def conversation_loop(process):
             else:
                 # No speech - check if we've been waiting too long
                 if time.time() - wait_start >= CONVERSATION_TIMEOUT:
-                    print(f"{BLUE}[INFO]{RESET} No input detected, exiting conversation mode.")
+                    dbg(f"{BLUE}[INFO]{RESET} No input detected, exiting conversation mode.")
                     return
         
         if not speech_chunks:
@@ -636,15 +647,15 @@ def conversation_loop(process):
         if not save_wav(speech_chunks, RAM_WAV):
             continue
         
-        print(f"{YELLOW}[TRANSCRIBING]{RESET}...")
+        dbg(f"{YELLOW}[TRANSCRIBING]{RESET}...")
         full_text = transcribe(RAM_WAV)
         
         if not full_text or len(full_text.strip()) < 2:
             empty_count += 1
             if empty_count >= max_empty:
-                print(f"{BLUE}[INFO]{RESET} No more input detected, exiting conversation mode.")
+                dbg(f"{BLUE}[INFO]{RESET} No more input detected, exiting conversation mode.")
                 return
-            print(f"{BLUE}[...]{RESET} Didn't catch that, still listening...")
+            dbg(f"{BLUE}[...]{RESET} Didn't catch that, still listening...")
             continue
         
         # Got speech - reset empty counter
@@ -674,13 +685,14 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     atexit.register(cleanup_processes)
     
-    print(f"{BLUE}=== JARVIS VOICE ASSISTANT ==={RESET}")
-    print(f"{BLUE}   * Wake Word:     {WAKE_WORD}{RESET}")
-    print(f"{BLUE}   * Model:         {MODEL}{RESET}")
-    print(f"{BLUE}   * Mic Input:     plughw:4,0 (AIRHUG 21){RESET}")
-    print(f"{BLUE}   * Threshold:    {THRESHOLD}{RESET}")
-    print(f"{BLUE}   * Whisper Model: {WHISPER_MODEL}{RESET}")
-    print()
+    if DEBUG_MODE:
+        print(f"{BLUE}=== JARVIS VOICE ASSISTANT ==={RESET}")
+        print(f"{BLUE}   * Wake Word:     {WAKE_WORD}{RESET}")
+        print(f"{BLUE}   * Model:         {MODEL}{RESET}")
+        print(f"{BLUE}   * Mic Input:     plughw:4,0 (AIRHUG 21){RESET}")
+        print(f"{BLUE}   * Threshold:    {THRESHOLD}{RESET}")
+        print(f"{BLUE}   * Whisper Model: {WHISPER_MODEL}{RESET}")
+        print()
     
     # Check dependencies
     if not os.path.exists(WHISPER_BIN):
@@ -694,11 +706,8 @@ def main():
         return
     
     # Pre-load TTS voice (suppresses ONNX warning here at startup)
-    print(f"{BLUE}[INIT]{RESET} Loading TTS voice...")
+    dbg(f"{BLUE}[INIT]{RESET} Loading TTS voice...")
     load_tts_voice()
-    
-    # Initialize persistent audio output (keeps USB device warm)
-    init_audio_output()
     
     # Start audio capture
     # Use plughw:4,0 for AIRHUG 21 microphone (card 4) - handles sample rate conversion
@@ -723,7 +732,7 @@ def main():
             print(f"{BLUE}[INFO]{RESET} Please check that AIRHUG 21 microphone (card 4) is connected")
             return
         else:
-            print(f"{GREEN}[OK]{RESET} Using microphone: plughw:4,0 (AIRHUG 21)")
+            dbg(f"{GREEN}[OK]{RESET} Using microphone: plughw:4,0 (AIRHUG 21)")
             # Discard first ~1 second of audio (USB mic initialization spike)
             discard_chunks = int(RATE / CHUNK * 1.0)
             for _ in range(discard_chunks):
@@ -736,7 +745,10 @@ def main():
     # Audio buffer for pre-speech capture
     pre_audio = collections.deque(maxlen=int(RATE / CHUNK * PREV_AUDIO))
     
-    print(f"{YELLOW}[LISTENING]{RESET} Say '{WAKE_WORD}' to activate...")
+    if not DEBUG_MODE:
+        print(f"{GREEN}Jarvis ready.{RESET}")
+    else:
+        print(f"{YELLOW}[LISTENING]{RESET} Say '{WAKE_WORD}' to activate...")
     print()
     
     try:
@@ -750,32 +762,34 @@ def main():
         while True:
             chunk = process.stdout.read(CHUNK * 2)
             if not chunk:
-                print(f"{BLUE}[DEBUG]{RESET} No audio data received, exiting...")
+                dbg(f"{BLUE}[DEBUG]{RESET} No audio data received, exiting...")
                 break
             
             rms = get_rms(chunk)
             pre_audio.append(chunk)
             
             # Live RMS meter (updates ~10x per second, only when not speaking/processing)
-            meter_counter += 1
-            if not is_speaking and meter_counter >= METER_INTERVAL:
-                meter_counter = 0
-                bar_level = min(int(rms / 200), METER_WIDTH)  # Scale: 200 RMS per char
-                thresh_pos = min(int(THRESHOLD / 200), METER_WIDTH)
-                bar = ""
-                for i in range(METER_WIDTH):
-                    if i < bar_level:
-                        bar += "\033[1;32m#\033[0m" if i < thresh_pos else "\033[1;31m#\033[0m"
-                    elif i == thresh_pos:
-                        bar += "\033[1;33m|\033[0m"
-                    else:
-                        bar += " "
-                print(f"\r  RMS [{bar}] {rms:5.0f}/{THRESHOLD}", end="", flush=True)
+            if DEBUG_MODE:
+                meter_counter += 1
+                if not is_speaking and meter_counter >= METER_INTERVAL:
+                    meter_counter = 0
+                    bar_level = min(int(rms / 200), METER_WIDTH)  # Scale: 200 RMS per char
+                    thresh_pos = min(int(THRESHOLD / 200), METER_WIDTH)
+                    bar = ""
+                    for i in range(METER_WIDTH):
+                        if i < bar_level:
+                            bar += "\033[1;32m#\033[0m" if i < thresh_pos else "\033[1;31m#\033[0m"
+                        elif i == thresh_pos:
+                            bar += "\033[1;33m|\033[0m"
+                        else:
+                            bar += " "
+                    print(f"\r  RMS [{bar}] {rms:5.0f}/{THRESHOLD}", end="", flush=True)
             
             if rms >= THRESHOLD:
                 # Voice detected
                 if not is_speaking:
-                    print()  # Clear meter line
+                    if DEBUG_MODE:
+                        print()  # Clear meter line
                     is_speaking = True
                     speech_chunks = list(pre_audio)
                 else:
@@ -792,7 +806,7 @@ def main():
                     silence_start = None
                     
                     if save_wav(speech_chunks, RAM_WAV):
-                        print(f"{YELLOW}[TRANSCRIBING]{RESET}...")
+                        dbg(f"{YELLOW}[TRANSCRIBING]{RESET}...")
                         text = transcribe(RAM_WAV)
                         
                         if text:
@@ -800,7 +814,7 @@ def main():
                             
                             if command is not None:
                                 # "Jarvis" was in the sentence
-                                print(f"{GREEN}[WAKE WORD DETECTED]{RESET}")
+                                dbg(f"{GREEN}[WAKE WORD DETECTED]{RESET}")
                                 play_ping_sound()
                                 
                                 if len(command) >= 2:
@@ -811,22 +825,22 @@ def main():
                                     drain_mic(process)
                                 
                                 # Enter conversation mode
-                                print(f"{GREEN}[CONVERSATION MODE]{RESET} Keep talking, no need to say '{WAKE_WORD}'")
+                                dbg(f"{GREEN}[CONVERSATION MODE]{RESET} Keep talking, no need to say '{WAKE_WORD}'")
                                 conversation_loop(process)
                                 
                                 # Back to wake word mode
                                 pre_audio.clear()
                                 drain_mic(process)
                                 
-                                print(f"\r{YELLOW}[LISTENING]{RESET} Say '{WAKE_WORD}' to activate...")
-                                print()
+                                dbg(f"{YELLOW}[LISTENING]{RESET} Say '{WAKE_WORD}' to activate...")
                     
                     speech_chunks = []
     
     except KeyboardInterrupt:
-        print(f"\n{BLUE}[SHUTDOWN]{RESET} Stopping...")
+        dbg(f"\n{BLUE}[SHUTDOWN]{RESET} Stopping...")
+        print()
     except Exception as e:
-        print(f"\n{BLUE}[ERROR]{RESET} Unexpected error: {e}")
+        print(f"\n{BLUE}[ERROR]{RESET} Unexpected error: {e}")  # always show
     finally:
         cleanup_processes()
 
