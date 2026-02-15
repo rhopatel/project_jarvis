@@ -1,0 +1,34 @@
+[Unit]
+Description=Jarvis Voice Assistant
+After=network-online.target sound.target
+Wants=network-online.target
+# Wait for actual network (Kasa, Ollama) and audio (mic, speakers)
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Change User to your Raspberry Pi username (e.g. pi, rohan)
+User=pi
+Group=pi
+
+# Project directory - update path if your project lives elsewhere
+WorkingDirectory=/home/pi/Documents/project_jarvis
+
+# Run the wrapper script (activates venv, sets env, runs jarvis.py)
+ExecStart=/home/pi/Documents/project_jarvis/run_jarvis.sh
+
+# Restart if it exits (e.g. crash, USB mic unplugged)
+Restart=always
+RestartSec=10
+
+# Allow time for network and audio at boot
+TimeoutStartSec=120
+
+# Ensure clean environment for audio
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jarvis
+
+[Install]
+WantedBy=multi-user.target

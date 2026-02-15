@@ -37,8 +37,8 @@ done
 
 # Boost mic capture volume (tries first few ALSA cards)
 for c in 0 1 2 3 4 5; do
-    amixer -c $c set Capture 100% 2>/dev/null && break
-    amixer -c $c set Mic 100% 2>/dev/null && break
+    amixer -c $c set Capture 100% 2>/dev/null >/dev/null && break
+    amixer -c $c set Mic 100% 2>/dev/null >/dev/null && break
 done
 
 # Check if jarvis.py exists

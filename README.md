@@ -86,7 +86,7 @@ done
 ### Quick Start (Recommended)
 Use the wrapper script which automatically activates the virtual environment:
 ```bash
-./jarvis.sh
+./run_jarvis.sh
 ```
 
 ### Manual Start
@@ -124,6 +124,27 @@ JARVIS: I don't have access to real-time weather data...
 
 [SPEAKING]...
 ```
+
+## Deployment (Auto-start on Boot)
+
+To run Jarvis automatically when the Raspberry Pi boots:
+
+```bash
+sudo ./install_service.sh
+sudo systemctl enable jarvis
+sudo systemctl start jarvis
+```
+
+- **Status**: `sudo systemctl status jarvis`
+- **Logs**: `journalctl -u jarvis -f`
+- **Stop**: `sudo systemctl stop jarvis`
+- **Disable**: `sudo systemctl disable jarvis` (stops auto-start)
+
+The service waits for network (Kasa, Ollama) and audio before starting, and restarts if it exits.
+
+### Raspberry Pi LED Indicator
+
+When Jarvis is running, the red PWR LED stays **solid**. When Jarvis stops, the LED reverts to normal. This requires write access to `/sys/class/leds/`. If running as a normal user, LED control may fail silently; the assistant still works. To enable LED on a system service, you can add a udev rule or run the service as root (not recommended for audio).
 
 ## Configuration
 
@@ -179,7 +200,9 @@ PIPER_VOICE_NAME = "en_US-lessac-medium"
 ## Files
 
 - `jarvis.py` - Main voice assistant script
-- `jarvis.sh` - Wrapper script (auto-activates venv and runs jarvis.py)
+- `run_jarvis.sh` - Wrapper script (auto-activates venv and runs jarvis.py)
+- `jarvis.service` - systemd unit for auto-start
+- `install_service.sh` - Installs the systemd service
 - `jarvis_silent.py` - Console-only version (reference)
 - `requirements.txt` - Python dependencies
 - `set_performance_mode.sh` - CPU performance mode script

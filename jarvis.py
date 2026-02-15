@@ -18,16 +18,18 @@ import signal
 import atexit
 import re
 import select
+import tempfile
 from typing import Optional
 
 
 # ── Configuration ─────────────────────────────────────────────
 
 DEBUG              = 0            # 0 = clean (YOU/JARVIS only), 1 = verbose
+VAD_DEBUG_SAVE     = 0            # 1 = save captured WAV to vad_captures/ (verify full command), 0 = off
 WAKE_WORD          = "Jarvis"
 SIMILARITY_THRESH  = 0.6
 THRESHOLD          = 1000        # RMS threshold for voice activity detection
-SILENCE_LIMIT      = 0.5         # seconds of silence (wake-word / quick commands)
+SILENCE_LIMIT      = 0.7         # seconds of silence (0.5 was cutting off "light on")
 SILENCE_LIMIT_CONV = 1.2        # seconds of silence in conversation mode (longer pauses ok)
 PRE_AUDIO          = 0.25        # seconds of pre-roll before speech (minimal)
 CONVERSATION_TIMEOUT = 30        # seconds of no speech to exit conversation
@@ -50,6 +52,8 @@ QUICK_COMMANDS     = [
     ("LIGHT_ON",  ["turn on lights", "lights on", "switch on lights", "light on"], "kasa_on"),
     ("LIGHT_OFF", ["turn off lights", "lights off", "switch off lights", "light off"], "kasa_off"),
 ]
+# "light" alone = LIGHT_ON (for cut-off) but not when they said "light off"
+QUICK_FALLBACK    = ("LIGHT_ON", "light", "kasa_on")  # (name, phrase, reaction) if phrase in cmd and "light off" not in cmd
 CHUNK              = 1024
 
 SYSTEM_PROMPT = (
@@ -196,6 +200,28 @@ def _trim_trailing_silence(path: str, thresh: float = 800) -> str:
     except Exception:
         pass
     return path
+
+
+def _warm_whisper():
+    """Preload Whisper model so first real transcription is fast."""
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(RATE)
+            wf.writeframes(b"\x00\x00" * int(RATE * 0.5))  # 0.5s silence
+        transcribe(path)
+    except Exception:
+        pass
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def transcribe(path: str) -> str:
@@ -366,6 +392,22 @@ def speak(text: str):
 
 # ── Microphone / VAD ─────────────────────────────────────────
 
+def _save_vad_debug(wav_path: str, text: str):
+    """Save captured WAV for verification - listen to check we got the full command."""
+    try:
+        import shutil
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vad_captures")
+        os.makedirs(d, exist_ok=True)
+        with wave.open(wav_path, "rb") as wf:
+            dur = wf.getnframes() / wf.getframerate()
+        safe = re.sub(r"[^\w\s]", "", text)[:40].replace(" ", "_") or "empty"
+        dst = os.path.join(d, f"{int(time.time())}_{dur:.1f}s_{safe}.wav")
+        shutil.copy2(wav_path, dst)
+        print(f"  [VAD] saved {dur:.1f}s → {dst}")
+    except Exception:
+        pass
+
+
 def wait_for_silence(settle: float = 0.5):
     """Read and discard mic data until the room is quiet for *settle* seconds."""
     quiet_since = None
@@ -531,6 +573,10 @@ def match_quick_command(text: str) -> Optional[tuple]:
             if phrase in cmd:
                 dbg(f"{BLUE}[QUICK]{RESET} Matched '{phrase}' -> {name}")
                 return (name, reaction)
+    # Fallback: "light" alone = on (handles cut-off) but not "light off"
+    if QUICK_FALLBACK and QUICK_FALLBACK[1] in cmd and "light off" not in cmd:
+        dbg(f"{BLUE}[QUICK]{RESET} Fallback '{QUICK_FALLBACK[1]}' -> {QUICK_FALLBACK[0]}")
+        return (QUICK_FALLBACK[0], QUICK_FALLBACK[2])
     return None
 
 
@@ -615,6 +661,8 @@ def conversation():
 
         save_wav(chunks, RAM_WAV)
         text = transcribe(RAM_WAV)
+        if VAD_DEBUG_SAVE:
+            _save_vad_debug(RAM_WAV, text)
         try:
             os.remove(RAM_WAV)
         except OSError:
@@ -626,10 +674,52 @@ def conversation():
         ask_jarvis(text)
 
 
+# ── Raspberry Pi LED status ─────────────────────────────────────
+
+_PI_LED_PWR = None
+_PI_LED_SAVED_TRIGGER = None
+
+
+def _pi_led_set_running(running: bool):
+    """Set the Pi's PWR (red) LED: solid on = Jarvis running, restore default on exit.
+    Fails silently if not on a Pi or without permission.
+    """
+    global _PI_LED_PWR, _PI_LED_SAVED_TRIGGER
+    base = "/sys/class/leds"
+    if not os.path.isdir(base):
+        return
+    for name in os.listdir(base):
+        if "pwr" in name.lower() or "power" in name.lower() or name == "led1":
+            led = os.path.join(base, name)
+            trigger_path = os.path.join(led, "trigger")
+            brightness_path = os.path.join(led, "brightness")
+            if not os.path.isfile(trigger_path):
+                continue
+            try:
+                if running:
+                    with open(trigger_path) as f:
+                        raw = f.read()
+                    m = re.search(r"\[(\w+)\]", raw)
+                    _PI_LED_SAVED_TRIGGER = m.group(1) if m else "input"
+                    _PI_LED_PWR = led
+                    with open(trigger_path, "w") as f:
+                        f.write("none\n")
+                    if os.path.isfile(brightness_path):
+                        with open(brightness_path, "w") as f:
+                            f.write("1\n")
+                elif _PI_LED_PWR == led and _PI_LED_SAVED_TRIGGER:
+                    with open(trigger_path, "w") as f:
+                        f.write(_PI_LED_SAVED_TRIGGER)
+            except (OSError, PermissionError):
+                pass
+            break
+
+
 # ── Cleanup ───────────────────────────────────────────────────
 
 def cleanup():
-    """Terminate the microphone subprocess."""
+    """Terminate the microphone subprocess and restore Pi LED."""
+    _pi_led_set_running(False)
     if _mic and _mic.poll() is None:
         _mic.terminate()
         try:
@@ -683,11 +773,15 @@ def main():
     for _ in range(int(RATE / CHUNK)):
         _mic.stdout.read(CHUNK * 2)
 
+    # Initialize everything before "ready" so first command is fast
+    dbg(f"{BLUE}[STARTUP]{RESET} Warming Whisper...")
+    _warm_whisper()
+    dbg(f"{BLUE}[STARTUP]{RESET} Discovering Kasa devices...")
+    _kasa_discover()
+
     print(f"{GREEN}Jarvis ready.{RESET}\n")
 
-    # Pre-warm Kasa discovery in background (first light command will be faster)
-    import threading
-    threading.Thread(target=_kasa_discover, daemon=True).start()
+    _pi_led_set_running(True)  # Solid red PWR LED = Jarvis running (Pi only)
 
     # ── Wake-word loop ────────────────────────────────────────
     while True:
@@ -697,6 +791,8 @@ def main():
 
         save_wav(chunks, RAM_WAV)
         text = transcribe(RAM_WAV)
+        if VAD_DEBUG_SAVE:
+            _save_vad_debug(RAM_WAV, text)
         try:
             os.remove(RAM_WAV)
         except OSError:

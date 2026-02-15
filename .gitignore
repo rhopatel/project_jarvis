@@ -1,3 +1,5 @@
 **/__pycache__/**
 tts_debug/**
+vad_captures/**
+vad_test/**
 .env
