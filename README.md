@@ -67,11 +67,11 @@ PIPER_VOICE = "en_US-ryan-high"
 
 ### 5. (Optional) Mic Calibration
 
-If transcription is off, calibrate your mic levels:
+If Jarvis doesn't hear you (e.g. with heater or AC on), calibrate in that environment:
 ```bash
 python calibrate_mic.py
 ```
-Speak for 5 seconds; it suggests a THRESHOLD value for `jarvis.py`.
+It records ambient noise first, then your speech, and suggests a THRESHOLD. **Run it with your heater/typical noise on** so the threshold is set above ambient.
 
 ### 6. (Optional) Set CPU Performance Mode
 
@@ -148,13 +148,14 @@ sudo systemctl start jarvis
 
 The service waits for network (Kasa, Ollama) and audio before starting, and restarts if it exits.
 
-### Raspberry Pi LED Indicator
+### Raspberry Pi LED Indicator (systemd service only)
 
+When Jarvis runs via the systemd service (which runs as root), the LEDs show status:
 - **Green** = ready to listen (say "Jarvis" to activate)
 - **Red** = thinking or speaking (wait until green to talk again)
 - On exit, both LEDs revert to normal
 
-**LED control requires root.** Run `sudo ./run_jarvis.sh` for LED status. The systemd service runs as your user for audio, so the LED won't change unless the service is configured to run as root.
+Manual runs (`./run_jarvis.sh`) don't change LEDs.
 
 ### Systemd: Disable, Restart, Reinstall
 
@@ -174,7 +175,7 @@ WAKE_WORD = "Jarvis"
 SIMILARITY_THRESH = 0.6    # Wake word match threshold (0.0-1.0)
 
 # Audio
-THRESHOLD = 500            # RMS threshold for VAD (calibrate with calibrate_mic.py)
+THRESHOLD = 1000            # RMS threshold for VAD (calibrate with calibrate_mic.py)
 SILENCE_LIMIT = 1.1        # Seconds of silence to stop recording
 SILENCE_LIMIT_CONV = 1.5   # Silence limit in conversation mode
 

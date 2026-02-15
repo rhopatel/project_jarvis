@@ -8,10 +8,10 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-# Run as your user for audio (PulseAudio/PipeWire needs user session).
-# LED control requires root and won't work; run manually with sudo for LED.
-User=pi
-Group=pi
+# Run as root for LED control. XDG_RUNTIME_DIR (install script substitutes UID)
+# lets paplay connect to the desktop user's PipeWire for audio.
+User=root
+Group=root
 
 # So paplay can find PipeWire socket (install script substitutes UID)
 Environment="XDG_RUNTIME_DIR=/run/user/1000"

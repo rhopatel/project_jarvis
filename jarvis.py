@@ -28,7 +28,7 @@ DEBUG              = 0            # 0 = clean (YOU/JARVIS only), 1 = verbose
 VAD_DEBUG_SAVE     = 0            # 1 = save captured WAV to vad_captures/ (verify full command), 0 = off
 WAKE_WORD          = "Jarvis"
 SIMILARITY_THRESH  = 0.6
-THRESHOLD          = 500         # RMS threshold for voice activity detection (calibrated)
+THRESHOLD          = 1000         # RMS threshold for voice activity detection (calibrated)
 SILENCE_LIMIT      = 1.1         # seconds of silence to end utterance (avoid cutting off "how's it going today")
 SILENCE_LIMIT_CONV = 1.5        # seconds of silence in conversation mode (allow natural pauses)
 PRE_AUDIO          = 0.25        # seconds of pre-roll before speech (minimal)
@@ -59,7 +59,10 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SYSTEM_PROMPT_PATH = os.path.join(_SCRIPT_DIR, "system_prompt.txt")
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Jarvis, a helpful voice assistant. "
-    "Keep responses short and concise unless asked to elaborate."
+    "Keep responses short and concise unless asked to elaborate. "
+    "You speak out loud: reply in plain conversational language only. "
+    "Never use markdown (no asterisks, bullets, bold, code blocks). "
+    "Respond the way a human would when talking—no special formatting."
 )
 
 
@@ -85,9 +88,14 @@ _WHISPER_BASE = os.path.join(_SCRIPT_DIR, "..", "whisper.cpp")
 WHISPER_BIN = os.path.join(_WHISPER_BASE, "build", "bin", "whisper-cli")
 WHISPER_MODEL_FAST = os.path.join(_WHISPER_BASE, "models", "ggml-tiny.en-q4_0.bin")      # <2s: quick commands
 WHISPER_MODEL_ACCURATE = os.path.join(_WHISPER_BASE, "models", "ggml-base.en-q4_0.bin")  # >=2s: conversation
-WHISPER_SHORT_THRESH   = 2.0  # seconds: use fast model below this, accurate above
-# Initial prompt biases transcription toward these phrases (reduces "lay on him" -> "light on" etc.)
-WHISPER_PROMPT = "Jarvis Jarvis light on lights off turn on turn off switch"
+WHISPER_SHORT_THRESH = 2.0  # seconds: use fast model below this, accurate above
+# Short clips: heavy bias toward quick commands. Long clips: no bias (likely conversation).
+WHISPER_PROMPT_QUICK = (
+    "Jarvis Jarvis light on lights off turn on turn off turn the lights on "
+    "turn the lights off lights on lights off switch on switch off "
+    "turn light on turn lights on lay on late on"
+)
+WHISPER_PROMPT_CONV = ""  # No biasing for long clips
 
 
 def _detect_mic_device() -> str:
@@ -110,8 +118,6 @@ def _detect_mic_device() -> str:
 
 MIC_DEVICE = _detect_mic_device()
 RAM_WAV = "/dev/shm/jarvis_vad.wav"
-TTS_RAW_WAV = "/dev/shm/jarvis_tts_raw.wav"   # TTS synthesis temp (RAM disk)
-TTS_WAV = "/dev/shm/jarvis_tts.wav"           # TTS output with dup (RAM disk)
 
 PIPER_VOICE     = "en_US-ryan-high"  # Higher quality; fallback to medium if high missing
 PIPER_VOICE_DIR = os.path.expanduser("~/.local/share/piper/voices")
@@ -258,14 +264,15 @@ def transcribe(path: str) -> tuple[str, float]:
     model = WHISPER_MODEL_FAST if dur < WHISPER_SHORT_THRESH else WHISPER_MODEL_ACCURATE
     t0 = time.time()
     nthreads = min(4, (os.cpu_count() or 4))
+    prompt = WHISPER_PROMPT_QUICK if dur < WHISPER_SHORT_THRESH else WHISPER_PROMPT_CONV
     cmd = [
         WHISPER_BIN, "-m", model, "-f", path,
         "-t", str(nthreads), "-bs", "1", "-bo", "1",
-        "-ml", "32",  # Short commands only
+        "-ml", "32" if dur < WHISPER_SHORT_THRESH else "64",  # Shorter max for quick commands
         "--no-timestamps", "-l", "en",
     ]
-    if WHISPER_PROMPT:
-        cmd.extend(["--prompt", WHISPER_PROMPT])
+    if prompt:
+        cmd.extend(["--prompt", prompt])
     try:
         r = subprocess.run(
             cmd,
@@ -290,8 +297,8 @@ def transcribe(path: str) -> tuple[str, float]:
 
 
 def _fix_lights_mishearing(text: str) -> str:
-    """Replace Whisper mishearings of 'lights' in turn on/off context."""
-    if not text or len(text) < 6:
+    """Replace Whisper mishearings of 'light/lights' in turn on/off context."""
+    if not text or len(text) < 5:
         return text
     lowered = text.lower()
     # "turn off the X" / "turn on the X" where X sounds like "lights"
@@ -306,6 +313,21 @@ def _fix_lights_mishearing(text: str) -> str:
     ]:
         if re.search(pattern, lowered):
             return re.sub(pattern, replacement, text, flags=re.I)
+    # "late", "lay", "lite" -> "light" (e.g. "Jarvis late on", "computer lay on")
+    for wrong, correct in [
+        (r"\blate\s+on\b", "light on"),
+        (r"\blay\s+on\b", "light on"),
+        (r"\blite\s+on\b", "light on"),
+        (r"\blate\s+off\b", "light off"),
+        (r"\blay\s+off\b", "light off"),
+        (r"\blite\s+off\b", "light off"),
+        (r"\bthe\s+late\b", "the light"),
+        (r"\bthe\s+lay\b", "the light"),
+        (r"\bturn\s+late\b", "turn light"),
+        (r"\bturn\s+lay\b", "turn light"),
+    ]:
+        if re.search(wrong, lowered):
+            return re.sub(wrong, correct, text, flags=re.I)
     return text
 
 
@@ -314,8 +336,8 @@ def _fix_jarvis_mishearing(text: str) -> str:
     if not text or len(text) < 5:
         return text
     lowered = text.lower()
-    # "driver's", "drivers", "driver is" etc. at start -> "Jarvis"
-    for mis in (r"^driver'?s?\s+", r"^drivers\s+", r"^driver\s+is\s+"):
+    # "driver's", "drivers", "computer", etc. at start -> "Jarvis"
+    for mis in (r"^driver'?s?\s+", r"^drivers\s+", r"^driver\s+is\s+", r"^computer\s+"):
         if re.search(mis, lowered):
             return "Jarvis " + re.sub(mis, "", text, flags=re.I).strip()
     return text
@@ -398,9 +420,24 @@ def load_tts():
     dbg(f"{GREEN}[OK]{RESET} TTS loaded")
 
 
+def _sanitize_for_tts(text: str) -> str:
+    """Strip markdown and problematic Unicode before TTS. Piper can't speak asterisks or IPA."""
+    if not text:
+        return ""
+    # Remove markdown bold/italic (**, *), bullets (-, *, •), leading " * "
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)   # **bold** -> bold
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)      # *italic* -> italic
+    text = re.sub(r"^\s*[-*•]\s*", "", text, flags=re.M)  # bullet lines
+    text = re.sub(r"\n\s*[-*•]\s*", ". ", text)    # convert bullets to sentence breaks
+    text = re.sub(r"\s*\*\s*", " ", text)          # lone asterisks
+    # Remove combining/IPA chars Piper can't pronounce (e.g. U+0329)
+    text = "".join(c for c in text if not (0x0300 <= ord(c) <= 0x036F))
+    return text.strip()
+
+
 def _split_sentences(text: str) -> list:
     """Split text into sentences. Play each as soon as synthesized for lower latency."""
-    text = text.strip()
+    text = _sanitize_for_tts(text.strip())
     if not text:
         return []
     # Split on sentence boundaries (. ! ?) - keep delimiters
@@ -426,26 +463,34 @@ def speak(text: str):
     for sent in sentences:
         if not sent.strip():
             continue
+        raw_path = tempfile.mktemp(suffix=".wav", prefix="jarvis_tts_")
+        out_path = tempfile.mktemp(suffix=".wav", prefix="jarvis_play_")
         try:
-            with wave.open(TTS_RAW_WAV, "wb") as wf:
+            with wave.open(raw_path, "wb") as wf:
                 _tts_voice.synthesize_wav(sent, wf, syn_config=cfg)
-            with wave.open(TTS_RAW_WAV, "rb") as rf:
+            with wave.open(raw_path, "rb") as rf:
                 params = rf.getparams()
                 audio = rf.readframes(rf.getnframes())
             dup_ms = 150  # USB speaker cuts start; prepend dup so each sentence is audible
             if dup_ms > 0:
                 dup_bytes = int(params.framerate * dup_ms / 1000) * params.sampwidth * params.nchannels
                 dup = audio[:min(dup_bytes, len(audio))]
-                with wave.open(TTS_WAV, "wb") as wf:
+                with wave.open(out_path, "wb") as wf:
                     wf.setparams(params)
                     wf.writeframes(dup + audio)
             else:
-                with wave.open(TTS_WAV, "wb") as wf:
+                with wave.open(out_path, "wb") as wf:
                     wf.setparams(params)
                     wf.writeframes(audio)
-            play_wav(TTS_WAV)
+            play_wav(out_path)
         except OSError:
             pass
+        finally:
+            for p in (raw_path, out_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 # ── Microphone / VAD ─────────────────────────────────────────
@@ -859,8 +904,11 @@ _PI_LED_OK = False     # True if both LEDs found and we have permission
 
 
 def _pi_led_init() -> bool:
-    """Discover green (ACT) and red (PWR) LEDs. Save triggers. Returns True if both found."""
+    """Discover green (ACT) and red (PWR) LEDs. Save triggers. Returns True if both found.
+    Only runs when effective UID is 0 (root) - i.e. when started via systemd service."""
     global _PI_LED_GREEN, _PI_LED_RED, _PI_LED_SAVED
+    if os.geteuid() != 0:
+        return False
     base = "/sys/class/leds"
     if not os.path.isdir(base):
         return False
