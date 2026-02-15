@@ -42,32 +42,38 @@ Ensure whisper.cpp is built and the binary is accessible:
 - Binary: `./build/bin/whisper-cli` or `./main`
 - Model: `models/ggml-base.en.bin`
 
-Update paths in `jarvis.py` if needed:
-```python
-WHISPER_BIN = "./build/bin/whisper-cli"
-WHISPER_MODEL = "models/ggml-base.en.bin"
+Jarvis uses `base.en` (better accuracy than tiny). In whisper.cpp:
+```bash
+./models/download-ggml-model.sh base.en
+# Optional: quantize for speed (smaller, faster). Build first: cmake --build build
+./build/bin/quantize models/ggml-base.en.bin models/ggml-base.en-q4_0.bin q4_0
 ```
+Also try pre-built quantized: `./models/download-ggml-model.sh base.en-q5_1`. Falls back to tiny if base missing.
 
 ### 3. Configure Ollama
 
-Update PC IP address and model in `jarvis.py`:
+Default: `gemma3:12b`. Update in `jarvis.py` if needed:
 ```python
-PC_IP = "10.0.0.224"  # Your PC's IP address
-MODEL = "gemma3:12b"  # Your Ollama model
+OLLAMA_IP = "10.0.0.224"   # Your PC's IP
+OLLAMA_MODEL = "gemma3:12b"
 ```
 
 ### 4. Setup Piper TTS
 
-Piper TTS will automatically download voice models on first use. The default voice is `en_US-lessac-medium`.
-
-To use a different voice, update:
+Piper TTS downloads voices on first use. Default: `en_US-ryan-high` (best quality). Change in `jarvis.py`:
 ```python
-PIPER_VOICE_NAME = "en_US-lessac-medium"
+PIPER_VOICE = "en_US-ryan-high"
 ```
 
-Available voices can be found at: https://huggingface.co/rhasspy/piper-voices
+### 5. (Optional) Mic Calibration
 
-### 5. (Optional) Set CPU Performance Mode
+If transcription is off, calibrate your mic levels:
+```bash
+python calibrate_mic.py
+```
+Speak for 5 seconds; it suggests a THRESHOLD value for `jarvis.py`.
+
+### 6. (Optional) Set CPU Performance Mode
 
 For better responsiveness, set CPU governor to performance mode:
 ```bash

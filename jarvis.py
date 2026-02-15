@@ -28,15 +28,16 @@ DEBUG              = 0            # 0 = clean (YOU/JARVIS only), 1 = verbose
 VAD_DEBUG_SAVE     = 0            # 1 = save captured WAV to vad_captures/ (verify full command), 0 = off
 WAKE_WORD          = "Jarvis"
 SIMILARITY_THRESH  = 0.6
-THRESHOLD          = 1000        # RMS threshold for voice activity detection
+THRESHOLD          = 500         # RMS threshold for voice activity detection (calibrated)
 SILENCE_LIMIT      = 1.1         # seconds of silence to end utterance (avoid cutting off "how's it going today")
 SILENCE_LIMIT_CONV = 1.5        # seconds of silence in conversation mode (allow natural pauses)
 PRE_AUDIO          = 0.25        # seconds of pre-roll before speech (minimal)
 CONVERSATION_TIMEOUT = 30        # seconds of no speech to exit conversation
+MIN_UTTERANCE_DURATION = 0.25     # seconds: ignore captures shorter than this (reduces false triggers like "you")
 #BARGEIN_THRESHOLD  = 1800        # RMS to trigger barge-in (above speaker bleed)
 #BARGEIN_CHUNKS     = 3           # consecutive loud chunks needed (~200ms, prevents false triggers)
 OLLAMA_IP          = "10.0.0.224"
-OLLAMA_MODEL       = "gemma3:12b"
+OLLAMA_MODEL       = "gemma3:12b"      # Best overall assistant
 RATE               = 16000
 
 # TP-Link Kasa - direct local control (no cloud)
@@ -45,32 +46,31 @@ KASA_USERNAME      = ""  # e.g. "you@email.com" for Tapo/newer Kasa
 KASA_PASSWORD      = ""  # TP-Link cloud password
 
 # Curated quick commands: (NAME, voice_phrases, reaction)
-# NAME: ALL_CAPS identifier shown when triggered
-# reaction: "kasa_on" | "kasa_off" | ... (dispatched below)
+# Exact phrases matched first; fuzzy/pattern matching catches variations (see match_quick_command)
 QUICK_COMMANDS     = [
-    ("LIGHT_ON",  ["turn on lights", "lights on", "switch on lights", "light on"], "kasa_on"),
-    ("LIGHT_OFF", ["turn off lights", "lights off", "switch off lights", "light off"], "kasa_off"),
+    ("LIGHT_ON",  ["turn on lights", "turn on the lights", "lights on", "switch on lights", "light on"], "kasa_on"),
+    ("LIGHT_OFF", ["turn off lights", "turn off the lights", "lights off", "switch off lights", "light off"], "kasa_off"),
 ]
 # "light" alone = LIGHT_ON (for cut-off) but not when they said "light off"
-QUICK_FALLBACK    = ("LIGHT_ON", "light", "kasa_on")  # (name, phrase, reaction) if phrase in cmd and "light off" not in cmd
+QUICK_FALLBACK    = ("LIGHT_ON", "light", "kasa_on")
 CHUNK              = 1024
 
 SYSTEM_PROMPT = (
-    "You are Jarvis, a helpful AI assistant. "
+    "You are Jarvis, a helpful AI assistant and coding expert. "
     "You are running in 'Voice Mode'. "
     "Your responses should be concise, natural, and conversational. "
     "Speak as if you're having a conversation. "
-    "Do not use markdown formatting or special characters."
+    "Do not use markdown formatting or special characters. "
+    "Remember the conversation context and refer back to earlier topics when the user says 'it' or 'that'."
 )
 
 
 # ── Paths (fixed for this machine) ───────────────────────────
 
 WHISPER_BIN   = os.path.abspath("../whisper.cpp/build/bin/whisper-cli")
-# Prefer quantized model (faster, smaller) - fallback to full if missing
-WHISPER_MODEL = os.path.abspath("../whisper.cpp/models/ggml-tiny.en-q4_0.bin")
-if not os.path.exists(WHISPER_MODEL):
-    WHISPER_MODEL = os.path.abspath("../whisper.cpp/models/ggml-tiny.en.bin")
+WHISPER_MODEL_FAST     = os.path.abspath("../whisper.cpp/models/ggml-tiny.en-q4_0.bin")  # <2s: quick commands
+WHISPER_MODEL_ACCURATE = os.path.abspath("../whisper.cpp/models/ggml-base.en-q4_0.bin")  # >=2s: conversation
+WHISPER_SHORT_THRESH   = 2.0  # seconds: use fast model below this, accurate above
 # Initial prompt biases transcription toward these phrases (reduces "lay on him" -> "light on" etc.)
 WHISPER_PROMPT = "Jarvis Jarvis light on lights off turn on turn off switch"
 
@@ -98,7 +98,7 @@ RAM_WAV       = "/dev/shm/jarvis_vad.wav"
 TTS_WAV       = "/dev/shm/jarvis_tts.wav"
 TTS_RAW_WAV   = "/dev/shm/jarvis_tts_raw.wav"
 
-PIPER_VOICE     = "en_US-ryan-medium"
+PIPER_VOICE     = "en_US-ryan-high"  # Higher quality; fallback to medium if high missing
 PIPER_VOICE_DIR = os.path.expanduser("~/.local/share/piper/voices")
 
 
@@ -203,35 +203,48 @@ def _trim_trailing_silence(path: str, thresh: float = 800) -> str:
     return path
 
 
-def _warm_whisper():
-    """Preload Whisper model so first real transcription is fast."""
-    path = None
+def _get_wav_duration(path: str) -> float:
+    """Return duration in seconds."""
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            path = f.name
-        with wave.open(path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(RATE)
-            wf.writeframes(b"\x00\x00" * int(RATE * 0.5))  # 0.5s silence
-        transcribe(path)
+        with wave.open(path, "rb") as wf:
+            return wf.getnframes() / float(wf.getframerate())
     except Exception:
-        pass
-    finally:
-        if path:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        return 0.0
 
 
-def transcribe(path: str) -> str:
-    """Run whisper.cpp on a WAV file and return cleaned text."""
+def _warm_whisper():
+    """Preload both Whisper models so first transcription is fast."""
+    for secs in (0.5, 4.0):  # warm tiny (short) and base (long)
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                path = f.name
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(RATE)
+                wf.writeframes(b"\x00\x00" * int(RATE * secs))
+            transcribe(path)
+        except Exception:
+            pass
+        finally:
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def transcribe(path: str) -> tuple[str, float]:
+    """Run whisper.cpp on a WAV file and return cleaned text.
+    Uses tiny (fast) for clips <2s (quick commands), base (accurate) for longer (conversation)."""
     path = _trim_trailing_silence(path)
+    dur = _get_wav_duration(path)
+    model = WHISPER_MODEL_FAST if dur < WHISPER_SHORT_THRESH else WHISPER_MODEL_ACCURATE
     t0 = time.time()
     nthreads = min(4, (os.cpu_count() or 4))
     cmd = [
-        WHISPER_BIN, "-m", WHISPER_MODEL, "-f", path,
+        WHISPER_BIN, "-m", model, "-f", path,
         "-t", str(nthreads), "-bs", "1", "-bo", "1",
         "-ml", "32",  # Short commands only
         "--no-timestamps", "-l", "en",
@@ -244,18 +257,39 @@ def transcribe(path: str) -> str:
             capture_output=True, text=True, timeout=30, env=_whisper_env,
         )
     except subprocess.TimeoutExpired:
-        return ""
+        return ("", 0.0)
 
-    dbg(f"{BLUE}[PERF]{RESET} Transcription: {time.time() - t0:.2f}s")
+    dbg(f"{BLUE}[PERF]{RESET} Transcription ({dur:.1f}s, {'tiny' if dur < WHISPER_SHORT_THRESH else 'base'}): {time.time() - t0:.2f}s")
 
     if r.returncode != 0:
         dbg(f"{BLUE}[DEBUG]{RESET} Whisper stderr: {r.stderr[:200]}")
-        return ""
+        return ("", dur)
 
     # Strip whisper artefacts: [blank_audio], (silence), etc.
     text = re.sub(r"\[.*?\]|\(.*?\)", "", r.stdout).strip()
     # Fix common mishearings of "Jarvis" at start (e.g. "driver's light off")
     text = _fix_jarvis_mishearing(text)
+    # Fix common mishearings of "lights" (e.g. "turn off the wave" -> "turn off the lights")
+    text = _fix_lights_mishearing(text)
+    return (text, dur)
+
+
+def _fix_lights_mishearing(text: str) -> str:
+    """Replace Whisper mishearings of 'lights' in turn on/off context."""
+    if not text or len(text) < 6:
+        return text
+    lowered = text.lower()
+    # "turn off the X" / "turn on the X" where X sounds like "lights"
+    for pattern, replacement in [
+        (r"(turn\s+off\s+the\s+)wave\b", r"\g<1>lights"),
+        (r"(turn\s+on\s+the\s+)wave\b", r"\g<1>lights"),
+        (r"(turn\s+off\s+the\s+)live\b", r"\g<1>lights"),
+        (r"(turn\s+on\s+the\s+)live\b", r"\g<1>lights"),
+        (r"(turn\s+off\s+the\s+)life\b", r"\g<1>lights"),
+        (r"(turn\s+on\s+the\s+)life\b", r"\g<1>lights"),
+    ]:
+        if re.search(pattern, lowered):
+            return re.sub(pattern, replacement, text, flags=re.I)
     return text
 
 
@@ -348,8 +382,22 @@ def load_tts():
     dbg(f"{GREEN}[OK]{RESET} TTS loaded")
 
 
+def _split_sentences(text: str) -> list:
+    """Split text into sentences. Play each as soon as synthesized for lower latency."""
+    text = text.strip()
+    if not text:
+        return []
+    # Split on sentence boundaries (. ! ?) - keep delimiters
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    sentences = [p.strip() for p in parts if p.strip()]
+    if not sentences:
+        return [text]
+    return sentences
+
+
 def speak(text: str):
-    """Synthesise text with Piper, pad with silence, and play via PulseAudio.
+    """Synthesise text with Piper and play via PulseAudio.
+    Sentence-by-sentence: play first sentence as soon as ready (low latency).
     """
     if not text or not text.strip():
         return
@@ -357,38 +405,37 @@ def speak(text: str):
     from piper.config import SynthesisConfig
 
     cfg = SynthesisConfig(speaker_id=None, volume=0.25)
+    sentences = _split_sentences(text)
 
-    # Generate raw speech
-    with wave.open(TTS_RAW_WAV, "wb") as wf:
-        _tts_voice.synthesize_wav(text, wf, syn_config=cfg)
-
-    # Read it back, prepend duplicate of first 150ms (USB speaker drops start; dup gets cut)
-    with wave.open(TTS_RAW_WAV, "rb") as rf:
-        params = rf.getparams()
-        audio  = rf.readframes(rf.getnframes())
-
-    dup_ms = 150
-    dup_bytes = int(params.framerate * dup_ms / 1000) * params.sampwidth * params.nchannels
-    dup = audio[:dup_bytes]
-    with wave.open(TTS_WAV, "wb") as wf:
-        wf.setparams(params)
-        wf.writeframes(dup + audio)
-
-    # Debug: keep a copy
-    if DEBUG:
-        import shutil
-        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_debug")
-        os.makedirs(d, exist_ok=True)
-        dst = os.path.join(d, f"tts_{int(time.time())}.wav")
-        shutil.copy2(TTS_WAV, dst)
-        dbg(f"{BLUE}[DEBUG]{RESET} WAV saved: {dst}")
-
-    play_wav(TTS_WAV)
-    for p in (TTS_WAV, TTS_RAW_WAV):
+    for i, sent in enumerate(sentences):
+        if not sent.strip():
+            continue
+        raw_path = tempfile.mktemp(suffix=".wav", prefix="jarvis_tts_raw_")
+        out_path = tempfile.mktemp(suffix=".wav", prefix="jarvis_tts_")
         try:
-            os.remove(p)
-        except OSError:
-            pass
+            with wave.open(raw_path, "wb") as wf:
+                _tts_voice.synthesize_wav(sent, wf, syn_config=cfg)
+            with wave.open(raw_path, "rb") as rf:
+                params = rf.getparams()
+                audio = rf.readframes(rf.getnframes())
+            dup_ms = 150 if i == 0 else 0
+            if dup_ms > 0:
+                dup_bytes = int(params.framerate * dup_ms / 1000) * params.sampwidth * params.nchannels
+                dup = audio[:min(dup_bytes, len(audio))]
+                with wave.open(out_path, "wb") as wf:
+                    wf.setparams(params)
+                    wf.writeframes(dup + audio)
+            else:
+                with wave.open(out_path, "wb") as wf:
+                    wf.setparams(params)
+                    wf.writeframes(audio)
+            play_wav(out_path)
+        finally:
+            for p in (raw_path, out_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 # ── Microphone / VAD ─────────────────────────────────────────
@@ -566,16 +613,52 @@ def control_kasa_lights(on: bool) -> bool:
 # Layer 4: Ollama LLM - only if Layer 3 does not match
 
 
+# Fuzzy patterns for light commands - catches "turning on the lights", "turn the light off", etc.
+# (?:the|that|those)? matches "the light", "that light", "those lights"
+_LIGHT_ON_PATTERNS = [
+    r"\b(?:turn|switch|flip|put|get|bring)\w*\s+(?:(?:the|that|those)\s+)?(?:light|lights)\s+on\b",
+    r"\b(?:turn|switch|flip|put|get|bring)\w*\s+on\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
+    r"\b(?:light|lights)\s+on\b",
+    r"\bon\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
+    r"\b(?:can you|could you|please)\s+(?:turn|switch)\s+on\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
+]
+_LIGHT_OFF_PATTERNS = [
+    r"\b(?:turn|switch|flip|cut|kill)\w*\s+(?:(?:the|that|those)\s+)?(?:light|lights)\s+off\b",
+    r"\b(?:turn|switch|flip|cut|kill)\w*\s+off\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
+    r"\bkill\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",  # "kill the lights" = off
+    r"\bcut\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",   # "cut the lights" = off
+    r"\b(?:light|lights)\s+off\b",
+    r"\boff\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
+    r"\b(?:can you|could you|please)\s+(?:turn|switch)\s+off\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
+]
+# Exclude negations: "don't turn off", "don't turn on"
+_LIGHT_NEGATION = re.compile(r"\b(?:don't|dont|do not|never)\s+(?:turn|switch)", re.I)
+
+
 def match_quick_command(text: str) -> Optional[tuple]:
-    """If text matches a quick command phrase, return (NAME, reaction). Else None."""
+    """If text matches a quick command phrase or fuzzy light pattern, return (NAME, reaction). Else None."""
     cmd = text.lower().strip()
+    # Reject negations first
+    if _LIGHT_NEGATION.search(cmd):
+        return None
+    # Exact phrase match (fast path)
     for name, phrases, reaction in QUICK_COMMANDS:
         for phrase in phrases:
             if phrase in cmd:
                 dbg(f"{BLUE}[QUICK]{RESET} Matched '{phrase}' -> {name}")
                 return (name, reaction)
+    # Fuzzy pattern match for light commands
+    if re.search(r"\b(?:light|lights)s?\b", cmd):
+        for pat in _LIGHT_OFF_PATTERNS:
+            if re.search(pat, cmd, re.I):
+                dbg(f"{BLUE}[QUICK]{RESET} Fuzzy matched OFF pattern -> LIGHT_OFF")
+                return ("LIGHT_OFF", "kasa_off")
+        for pat in _LIGHT_ON_PATTERNS:
+            if re.search(pat, cmd, re.I):
+                dbg(f"{BLUE}[QUICK]{RESET} Fuzzy matched ON pattern -> LIGHT_ON")
+                return ("LIGHT_ON", "kasa_on")
     # Fallback: "light" alone = on (handles cut-off) but not "light off"
-    if QUICK_FALLBACK and QUICK_FALLBACK[1] in cmd and "light off" not in cmd:
+    if QUICK_FALLBACK and QUICK_FALLBACK[1] in cmd and "light off" not in cmd and "lights off" not in cmd:
         dbg(f"{BLUE}[QUICK]{RESET} Fallback '{QUICK_FALLBACK[1]}' -> {QUICK_FALLBACK[0]}")
         return (QUICK_FALLBACK[0], QUICK_FALLBACK[2])
     return None
@@ -590,15 +673,20 @@ def _run_quick_reaction(reaction: str) -> bool:
     return False
 
 
-def query_ollama(prompt: str) -> str:
-    """Send a prompt to Ollama and return the full response."""
-    url = f"http://{OLLAMA_IP}:11434/api/generate"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "system": SYSTEM_PROMPT,
-        "stream": True,
-    }
+# Conversation history for multi-turn context (max 10 turns)
+_chat_history: list = []
+_CHAT_HISTORY_MAX = 10
+
+
+def query_ollama(prompt: str, history: Optional[list] = None) -> str:
+    """Send prompt to Ollama chat API with conversation history. Returns assistant response."""
+    url = f"http://{OLLAMA_IP}:11434/api/chat"
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if history:
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": prompt})
+    payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": True}
     text = ""
     try:
         with requests.post(url, json=payload, stream=True, timeout=60) as r:
@@ -608,7 +696,9 @@ def query_ollama(prompt: str) -> str:
                     continue
                 try:
                     data = json.loads(line)
-                    text += data.get("response", "")
+                    chunk = data.get("message", {}).get("content", "")
+                    if isinstance(chunk, str):
+                        text += chunk
                     if data.get("done"):
                         break
                 except json.JSONDecodeError:
@@ -622,6 +712,7 @@ def ask_jarvis(text: str) -> bool:
     """Layer 3 first (local actions), Layer 4 only if no match.
     text: full utterance (include 'Jarvis' for LLM). COMMAND vs YOU based on Layer 3 match.
     Returns True if we gave a verbal LLM reply (enter conversation mode)."""
+    global _chat_history
     m = match_quick_command(text)
     if m is not None:
         name, reaction = m
@@ -635,8 +726,12 @@ def ask_jarvis(text: str) -> bool:
 
     print(f"{CYAN}YOU:{RESET} {text}")
     dbg(f"{YELLOW}[THINKING]{RESET}...")
-    response = query_ollama(text)
+    response = query_ollama(text, history=_chat_history)
     if response:
+        _chat_history.append({"role": "user", "content": text})
+        _chat_history.append({"role": "assistant", "content": response})
+        if len(_chat_history) > _CHAT_HISTORY_MAX * 2:
+            _chat_history = _chat_history[-_CHAT_HISTORY_MAX * 2 :]
         print(f"{GREEN}JARVIS:{RESET} {response}\n")
         speak(response)
         return True  # Verbal reply → enter conversation mode
@@ -658,10 +753,11 @@ def conversation():
         chunks = wait_for_speech(timeout=CONVERSATION_TIMEOUT, silence_limit=SILENCE_LIMIT_CONV)
         if not chunks:
             dbg(f"{BLUE}[INFO]{RESET} Conversation timeout.")
+            _chat_history.clear()  # Fresh context for next session
             return
 
         save_wav(chunks, RAM_WAV)
-        text = transcribe(RAM_WAV)
+        text, dur = transcribe(RAM_WAV)
         if VAD_DEBUG_SAVE:
             _save_vad_debug(RAM_WAV, text)
         try:
@@ -669,6 +765,9 @@ def conversation():
         except OSError:
             pass
         if not text or len(text) < 2:
+            continue
+        # Skip very short captures unless they match a quick command (reduces false triggers)
+        if dur < MIN_UTTERANCE_DURATION and match_quick_command(text) is None:
             continue
 
         # Don't edit: pass full text including "Jarvis" to LLM
@@ -747,11 +846,15 @@ def main():
 
     if DEBUG:
         print(f"{BLUE}=== JARVIS ==={RESET}")
-        print(f"  Model: {OLLAMA_MODEL}  Whisper: {os.path.basename(WHISPER_MODEL)}")
+        print(f"  Model: {OLLAMA_MODEL}  Whisper: tiny<{WHISPER_SHORT_THRESH}s else base")
         print(f"  Mic: {MIC_DEVICE}  Threshold: {THRESHOLD}\n")
 
     # Validate paths
-    for path, label in [(WHISPER_BIN, "Whisper binary"), (WHISPER_MODEL, "Whisper model")]:
+    for path, label in [
+        (WHISPER_BIN, "Whisper binary"),
+        (WHISPER_MODEL_FAST, "Whisper tiny model"),
+        (WHISPER_MODEL_ACCURATE, "Whisper base model"),
+    ]:
         if not os.path.exists(path):
             print(f"{BLUE}[ERROR]{RESET} {label} not found: {path}")
             return
@@ -792,7 +895,7 @@ def main():
             break
 
         save_wav(chunks, RAM_WAV)
-        text = transcribe(RAM_WAV)
+        text, dur = transcribe(RAM_WAV)
         if VAD_DEBUG_SAVE:
             _save_vad_debug(RAM_WAV, text)
         try:
@@ -800,6 +903,9 @@ def main():
         except OSError:
             pass
         if not text:
+            continue
+        # Skip very short captures unless they match a quick command
+        if dur < MIN_UTTERANCE_DURATION and match_quick_command(text) is None:
             continue
 
         command = extract_wake_command(text)
