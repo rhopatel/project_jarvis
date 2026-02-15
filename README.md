@@ -131,6 +131,16 @@ JARVIS: I don't have access to real-time weather data...
 [SPEAKING]...
 ```
 
+### Quick Commands (no LLM, &lt;2s)
+
+**All lights:** "turn on lights", "lights off"
+
+**Per device** (alias in Kasa app must match `KASA_DEVICES` in jarvis.py):
+- **Floor** (bedside, brightness-only): "turn floor off/on", "floor to 100%", "floor to half"
+- **Desk** (color bulb): "turn desk off/on", "desk to red", "desk to 50%"  
+**Brightness:** 100%, 50%, 25%, 75% or full, half, quarter, three quarters  
+**Colors:** red, orange, yellow, green, blue, indigo, violet
+
 ## Deployment (Auto-start on Boot)
 
 To run Jarvis automatically when the Raspberry Pi boots:

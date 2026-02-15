@@ -14,16 +14,17 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Create a copy with correct paths and XDG_RUNTIME_DIR (for PipeWire).
-# Service runs as root for LED control; XDG_RUNTIME_DIR points to your
-# desktop session so paplay can output audio.
+# Substitute paths and user. Service runs as YOU (inherits your audio session).
 SERVICE_UID=$(id -u "$SERVICE_USER")
+SERVICE_GROUP=$(id -gn "$SERVICE_USER")
 sed -e "s|/home/pi/Documents/project_jarvis|$SCRIPT_DIR|g" \
-    -e "s|/run/user/1000|/run/user/$SERVICE_UID|" \
+    -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+    -e "s|__SERVICE_GROUP__|$SERVICE_GROUP|g" \
+    -e "s|__SERVICE_UID__|$SERVICE_UID|g" \
     "$SERVICE_FILE" > "$SYSTEMD_DIR/jarvis.service"
 
 echo "Installed jarvis.service to $SYSTEMD_DIR"
-echo "  Runs as root (LED control). XDG_RUNTIME_DIR -> user $SERVICE_USER (audio)"
+echo "  Runs as $SERVICE_USER (your audio session)"
 echo "  WorkingDirectory: $SCRIPT_DIR"
 echo ""
 echo "Enable and start:"

@@ -1,20 +1,19 @@
 [Unit]
 Description=Jarvis Voice Assistant
-After=network-online.target sound.target
+After=network-online.target sound.target graphical.target
 Wants=network-online.target
-# If using desktop + PipeWire: add graphical.target to After and a short delay below
+# graphical.target ensures user is logged in so XDG_RUNTIME_DIR and PipeWire exist
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
 Type=simple
-# Run as root for LED control. XDG_RUNTIME_DIR (install script substitutes UID)
-# lets paplay connect to the desktop user's PipeWire for audio.
-User=root
-Group=root
+# Run as your user so TTS inherits your PipeWire/audio session.
+# Install script substitutes __SERVICE_USER__ and __SERVICE_GROUP__.
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
 
-# So paplay can find PipeWire socket (install script substitutes UID)
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="XDG_RUNTIME_DIR=/run/user/__SERVICE_UID__"
 
 # Project directory - update path if your project lives elsewhere
 WorkingDirectory=/home/pi/Documents/project_jarvis
@@ -38,4 +37,5 @@ StandardError=journal
 SyslogIdentifier=jarvis
 
 [Install]
-WantedBy=multi-user.target
+# graphical.target so user session exists before we start (audio needs it)
+WantedBy=graphical.target

@@ -24,14 +24,14 @@ from typing import Optional
 
 # ── Configuration ─────────────────────────────────────────────
 
-DEBUG              = 0            # 0 = clean (YOU/JARVIS only), 1 = verbose
+DEBUG = 0  # 0 = clean (YOU/JARVIS only), 1 = verbose. Override: --debug or JARVIS_DEBUG=1
 VAD_DEBUG_SAVE     = 0            # 1 = save captured WAV to vad_captures/ (verify full command), 0 = off
 WAKE_WORD          = "Jarvis"
-SIMILARITY_THRESH  = 0.6
-THRESHOLD          = 1000         # RMS threshold for voice activity detection (calibrated)
-SILENCE_LIMIT      = 1.1         # seconds of silence to end utterance (avoid cutting off "how's it going today")
-SILENCE_LIMIT_CONV = 1.5        # seconds of silence in conversation mode (allow natural pauses)
-PRE_AUDIO          = 0.25        # seconds of pre-roll before speech (minimal)
+SIMILARITY_THRESH = 0.35  # Wake word match (lower = more forgiving for mishearings)
+THRESHOLD          = 700         # RMS threshold for voice activity detection (calibrated)
+SILENCE_LIMIT = 1.1         # seconds of silence to end utterance
+SILENCE_LIMIT_CONV = 1.0    # Shorter in conversation so "light on" etc. stop sooner → use tiny model
+PRE_AUDIO          = 0.4         # seconds of pre-roll (catch start of "Jarvis")
 CONVERSATION_TIMEOUT = 30        # seconds of no speech to exit conversation
 MIN_UTTERANCE_DURATION = 0.25     # seconds: ignore captures shorter than this (reduces false triggers like "you")
 # Barge-in (interrupt TTS): uncomment and implement in conversation() if needed
@@ -44,14 +44,8 @@ RATE               = 16000
 KASA_USERNAME      = ""  # e.g. "you@email.com" for Tapo/newer Kasa
 KASA_PASSWORD      = ""  # TP-Link cloud password
 
-# Curated quick commands: (NAME, voice_phrases, reaction)
-# Exact phrases matched first; fuzzy/pattern matching catches variations (see match_quick_command)
-QUICK_COMMANDS     = [
-    ("LIGHT_ON",  ["turn on lights", "turn on the lights", "lights on", "switch on lights", "light on"], "kasa_on"),
-    ("LIGHT_OFF", ["turn off lights", "turn off the lights", "lights off", "switch off lights", "light off"], "kasa_off"),
-]
-# "light" alone = LIGHT_ON (for cut-off) but not when they said "light off"
-QUICK_FALLBACK    = ("LIGHT_ON", "light", "kasa_on")
+# Device aliases - must match names in Kasa app.
+KASA_DEVICES = ("floor", "desk")  # Floor (bedside), desk (desk lamp)
 CHUNK              = 1024
 
 # System prompt: load from system_prompt.txt (gitignored) or use default
@@ -88,12 +82,13 @@ _WHISPER_BASE = os.path.join(_SCRIPT_DIR, "..", "whisper.cpp")
 WHISPER_BIN = os.path.join(_WHISPER_BASE, "build", "bin", "whisper-cli")
 WHISPER_MODEL_FAST = os.path.join(_WHISPER_BASE, "models", "ggml-tiny.en-q4_0.bin")      # <2s: quick commands
 WHISPER_MODEL_ACCURATE = os.path.join(_WHISPER_BASE, "models", "ggml-base.en-q4_0.bin")  # >=2s: conversation
-WHISPER_SHORT_THRESH = 2.0  # seconds: use fast model below this, accurate above
-# Short clips: heavy bias toward quick commands. Long clips: no bias (likely conversation).
+WHISPER_SHORT_THRESH = 3.0  # seconds: use tiny below this (quicker for "light on"), base above
+# Short clips: bias toward quick commands (lights, floor, desk, on, off, colors)
+_dev_phrase = " ".join(f"turn {d} on turn {d} off {d} on {d} off" for d in KASA_DEVICES)
 WHISPER_PROMPT_QUICK = (
-    "Jarvis Jarvis light on lights off turn on turn off turn the lights on "
-    "turn the lights off lights on lights off switch on switch off "
-    "turn light on turn lights on lay on late on"
+    "Jarvis Jarvis Jarvis light on lights off turn on turn off "
+    f"{_dev_phrase} {' '.join(KASA_DEVICES)} "
+    "red orange yellow green blue indigo violet purple"
 )
 WHISPER_PROMPT_CONV = ""  # No biasing for long clips
 
@@ -177,18 +172,16 @@ def save_wav(chunks: list, path: str):
 
 
 def play_wav(path: str):
-    """Play a WAV. Prefer paplay (PipeWire/Pulse); fall back to aplay (ALSA) for system service."""
-    r = subprocess.run(
-        ["paplay", path], capture_output=True, timeout=120,
-    )
+    """Play a WAV via paplay (PipeWire/Pulse); fall back to aplay (ALSA) on failure."""
+    r = subprocess.run(["paplay", path], capture_output=True, timeout=120)
     if r.returncode != 0:
         subprocess.run(["aplay", "-q", path], stderr=subprocess.DEVNULL, timeout=120)
 
 
 # ── Whisper transcription ────────────────────────────────────
 
-def _trim_trailing_silence(path: str, thresh: float = 800) -> str:
-    """Trim trailing silence from WAV to reduce whisper processing time. Returns path."""
+def _trim_trailing_silence(path: str, thresh: float = 1500) -> str:
+    """Trim trailing silence from WAV. Higher thresh = trim more (works with ambient noise)."""
     try:
         with wave.open(path, "rb") as wf:
             nch, sw, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
@@ -199,7 +192,7 @@ def _trim_trailing_silence(path: str, thresh: float = 800) -> str:
         chunk_sz = int(rate * 0.02)  # 20ms chunks
         trim_end = n
         quiet_chunks = 0
-        need_quiet = int(0.25 * rate / chunk_sz)  # 250ms silence = cut
+        need_quiet = int(0.15 * rate / chunk_sz)  # 150ms quiet = cut (trim faster)
         for i in range(n - chunk_sz, 0, -chunk_sz):
             chunk = frames[i * sw * nch : (i + chunk_sz) * sw * nch]
             if len(chunk) < chunk_sz * sw * nch:
@@ -257,8 +250,7 @@ def _warm_whisper():
 
 
 def transcribe(path: str) -> tuple[str, float]:
-    """Run whisper.cpp on a WAV file and return cleaned text.
-    Uses tiny (fast) for clips <2s (quick commands), base (accurate) for longer (conversation)."""
+    """Run whisper.cpp on a WAV file. Tiny (<3s) for speed, base for longer conversation."""
     path = _trim_trailing_silence(path)
     dur = _get_wav_duration(path)
     model = WHISPER_MODEL_FAST if dur < WHISPER_SHORT_THRESH else WHISPER_MODEL_ACCURATE
@@ -268,7 +260,7 @@ def transcribe(path: str) -> tuple[str, float]:
     cmd = [
         WHISPER_BIN, "-m", model, "-f", path,
         "-t", str(nthreads), "-bs", "1", "-bo", "1",
-        "-ml", "32" if dur < WHISPER_SHORT_THRESH else "64",  # Shorter max for quick commands
+        "-ml", "32" if dur < WHISPER_SHORT_THRESH else "64",
         "--no-timestamps", "-l", "en",
     ]
     if prompt:
@@ -289,57 +281,58 @@ def transcribe(path: str) -> tuple[str, float]:
 
     # Strip whisper artefacts: [blank_audio], (silence), etc.
     text = re.sub(r"\[.*?\]|\(.*?\)", "", r.stdout).strip()
-    # Fix common mishearings of "Jarvis" at start (e.g. "driver's light off")
+    # Fix wake-word mishearings so we detect "Jarvis" (driver's, computer, etc.)
     text = _fix_jarvis_mishearing(text)
-    # Fix common mishearings of "lights" (e.g. "turn off the wave" -> "turn off the lights")
-    text = _fix_lights_mishearing(text)
+    text = _fix_command_mishearings(text)
     return (text, dur)
 
 
-def _fix_lights_mishearing(text: str) -> str:
-    """Replace Whisper mishearings of 'light/lights' in turn on/off context."""
-    if not text or len(text) < 5:
-        return text
-    lowered = text.lower()
-    # "turn off the X" / "turn on the X" where X sounds like "lights"
-    for pattern, replacement in [
-        (r"(turn\s+off\s+the\s+)wave\b", r"\g<1>lights"),
-        (r"(turn\s+on\s+the\s+)wave\b", r"\g<1>lights"),
-        (r"(turn\s+off\s+the\s+)live\b", r"\g<1>lights"),
-        (r"(turn\s+on\s+the\s+)live\b", r"\g<1>lights"),
-        (r"(turn\s+off\s+the\s+)life\b", r"\g<1>lights"),
-        (r"(turn\s+on\s+the\s+)life\b", r"\g<1>lights"),
-        (r"turn\s+all\s+the\s+way\b", "turn off the lights"),
-    ]:
-        if re.search(pattern, lowered):
-            return re.sub(pattern, replacement, text, flags=re.I)
-    # "late", "lay", "lite" -> "light" (e.g. "Jarvis late on", "computer lay on")
-    for wrong, correct in [
-        (r"\blate\s+on\b", "light on"),
-        (r"\blay\s+on\b", "light on"),
-        (r"\blite\s+on\b", "light on"),
-        (r"\blate\s+off\b", "light off"),
-        (r"\blay\s+off\b", "light off"),
-        (r"\blite\s+off\b", "light off"),
-        (r"\bthe\s+late\b", "the light"),
-        (r"\bthe\s+lay\b", "the light"),
-        (r"\bturn\s+late\b", "turn light"),
-        (r"\bturn\s+lay\b", "turn light"),
-    ]:
-        if re.search(wrong, lowered):
-            return re.sub(wrong, correct, text, flags=re.I)
-    return text
+# Words that sound like "Jarvis" - map to Jarvis for wake-word detection
+_JARVIS_LIKE = (
+    "travis", "darvis", "charvis", "charvus", "charis", "garvis", "yarvis", "jarvin", "jarvus",
+    "jarvis", "driver's", "drivers", "computer", "you",
+    "draw", "drop", "drive", "rose", "garbage",  # common Whisper tiny mishearings
+)
+
+# Whisper mishearings of command phrases (apply after wake-word fix)
+_CMD_MISHEARINGS = {
+    "sternal light": "turn off light",
+    "sternal lights": "turn off lights",
+    "strong flight": "turn on light",
+    "strong flights": "turn on lights",
+    "desk loop": "desk off",
+    "floor loop": "floor off",
+    "does red": "desk red",
+    "does red end": "desk red",
+    "des red": "desk red",
+    "disc red": "desk red",
+    "des red": "desk red",
+    "a slight line": "lights on",
+    "a slight lines": "lights on",
+    "just for all": "lights on",
+    "just for all lights": "lights on",
+}
+
+
+def _fix_command_mishearings(text: str) -> str:
+    """Fix Whisper mishearings of command phrases (e.g. sternal light -> turn off light)."""
+    t = text.lower()
+    for bad, good in _CMD_MISHEARINGS.items():
+        if bad in t:
+            t = t.replace(bad, good)
+    return t
 
 
 def _fix_jarvis_mishearing(text: str) -> str:
-    """Replace common mishearings of 'Jarvis' at sentence start."""
-    if not text or len(text) < 5:
+    """Fix wake-word mishearings: travis, charvis, you, draw, etc. -> Jarvis."""
+    if not text or len(text) < 3:  # allow "you" (3 chars)
         return text
-    lowered = text.lower()
-    # "driver's", "drivers", "computer", etc. at start -> "Jarvis"
-    for mis in (r"^driver'?s?\s+", r"^drivers\s+", r"^driver\s+is\s+", r"^computer\s+"):
-        if re.search(mis, lowered):
-            return "Jarvis " + re.sub(mis, "", text, flags=re.I).strip()
+    words = text.split()
+    if not words:
+        return text
+    first = words[0].lower().rstrip(".,!?;:")
+    if first in _JARVIS_LIKE or similarity(first, WAKE_WORD) >= 0.6:
+        return "Jarvis " + " ".join(words[1:]).strip()
     return text
 
 
@@ -618,6 +611,74 @@ def _kasa_discover():
     _kasa_devices = asyncio.run(_discover())
 
 
+def _kasa_get_device_by_alias(alias: str) -> Optional[tuple]:
+    """Return (ip, alias, model) for device whose alias matches (case-insensitive), or None."""
+    global _kasa_devices
+    if not _kasa_devices:
+        _kasa_discover()
+    want = alias.lower()
+    for ip, a, model in _kasa_devices:
+        if a and a.lower() == want:
+            return (ip, a, model)
+    return None
+
+
+# ROYGBIV: hue 0-360 (HSV)
+_KASA_COLORS = {
+    "red": 0, "orange": 30, "yellow": 60, "green": 120,
+    "blue": 240, "indigo": 260, "violet": 280, "purple": 280,
+}
+
+# Percent words -> 0-100
+_KASA_BRIGHTNESS_WORDS = {
+    "full": 100, "max": 100, "bright": 100, "all": 100,
+    "three quarters": 75, "three quarter": 75,
+    "half": 50, "mid": 50, "medium": 50,
+    "quarter": 25, "low": 25, "dim": 25,
+}
+
+
+def control_kasa_device(alias: str, brightness: Optional[int] = None,
+                       color: Optional[str] = None, on: Optional[bool] = None) -> bool:
+    """Control a single Kasa device by alias. Main=brightness only, Desk=color or brightness."""
+    global _kasa_devices, _kasa_creds
+    entry = _kasa_get_device_by_alias(alias)
+    if not entry:
+        return False
+    ip, _, model = entry
+
+    import asyncio
+    from kasa import Discover, Module
+
+    async def _control():
+        try:
+            dev = await Discover.discover_single(ip, credentials=_kasa_creds)
+            await dev.update()
+            if Module.Light not in dev.modules:
+                return False
+            light = dev.modules[Module.Light]
+            await dev.turn_on()
+            if on is False:
+                await dev.turn_off()
+                return True
+            if color is not None and light.has_feature("hsv"):
+                hue = _KASA_COLORS.get(color.lower(), 0)
+                bri = brightness if brightness is not None else 100
+                await light.set_hsv(hue, 100, bri)
+            elif brightness is not None:
+                if light.has_feature("brightness"):
+                    await light.set_brightness(brightness)
+                elif light.has_feature("hsv"):
+                    await light.set_hsv(0, 0, brightness)
+            await dev.update()
+            return True
+        except Exception as e:
+            dbg(f"{BLUE}[KASA]{RESET} {alias}: {e}")
+            return False
+
+    return asyncio.run(_control())
+
+
 def control_kasa_lights(on: bool) -> bool:
     """Control each device with a fresh connection. LB130 uses set_hsv for reliability."""
     global _kasa_devices, _kasa_creds
@@ -668,63 +729,77 @@ def control_kasa_lights(on: bool) -> bool:
 # Layer 4: Ollama LLM - only if Layer 3 does not match
 
 
-# Fuzzy patterns for light commands - catches "turning on the lights", "turn the light off", etc.
-# (?:the|that|those)? matches "the light", "that light", "those lights"
-_LIGHT_ON_PATTERNS = [
-    r"\b(?:turn|switch|flip|put|get|bring)\w*\s+(?:(?:the|that|those)\s+)?(?:light|lights)\s+on\b",
-    r"\b(?:turn|switch|flip|put|get|bring)\w*\s+on\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
-    r"\b(?:light|lights)\s+on\b",
-    r"\bon\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
-    r"\b(?:can you|could you|please)\s+(?:turn|switch)\s+on\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
-]
-_LIGHT_OFF_PATTERNS = [
-    r"\b(?:turn|switch|flip|cut|kill)\w*\s+(?:(?:the|that|those)\s+)?(?:light|lights)\s+off\b",
-    r"\b(?:turn|switch|flip|cut|kill)\w*\s+off\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
-    r"\bkill\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",  # "kill the lights" = off
-    r"\bcut\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",   # "cut the lights" = off
-    r"\b(?:light|lights)\s+off\b",
-    r"\boff\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
-    r"\b(?:can you|could you|please)\s+(?:turn|switch)\s+off\s+(?:(?:the|that|those)\s+)?(?:light|lights)\b",
-]
 # Exclude negations: "don't turn off", "don't turn on"
 _LIGHT_NEGATION = re.compile(r"\b(?:don't|dont|do not|never)\s+(?:turn|switch)", re.I)
 
 
 def match_quick_command(text: str) -> Optional[tuple]:
-    """If text matches a quick command phrase or fuzzy light pattern, return (NAME, reaction). Else None."""
-    cmd = text.lower().strip()
-    # Reject negations first
-    if _LIGHT_NEGATION.search(cmd):
+    """Keyword match: both lights ON/OFF, floor ON/OFF, desk ON/OFF, desk color.
+    Returns (name, reaction, params) or None."""
+    cmd = strip_wake_word(text).lower().strip() or text.lower().strip()
+    if _LIGHT_NEGATION.search(cmd) or len(cmd) < 2:
         return None
-    # Exact phrase match (fast path)
-    for name, phrases, reaction in QUICK_COMMANDS:
-        for phrase in phrases:
-            if phrase in cmd:
-                dbg(f"{BLUE}[QUICK]{RESET} Matched '{phrase}' -> {name}")
-                return (name, reaction)
-    # Fuzzy pattern match for light commands
-    if re.search(r"\b(?:light|lights)s?\b", cmd):
-        for pat in _LIGHT_OFF_PATTERNS:
-            if re.search(pat, cmd, re.I):
-                dbg(f"{BLUE}[QUICK]{RESET} Fuzzy matched OFF pattern -> LIGHT_OFF")
-                return ("LIGHT_OFF", "kasa_off")
-        for pat in _LIGHT_ON_PATTERNS:
-            if re.search(pat, cmd, re.I):
-                dbg(f"{BLUE}[QUICK]{RESET} Fuzzy matched ON pattern -> LIGHT_ON")
-                return ("LIGHT_ON", "kasa_on")
-    # Fallback: "light" alone = on (handles cut-off) but not "light off"
-    if QUICK_FALLBACK and QUICK_FALLBACK[1] in cmd and "light off" not in cmd and "lights off" not in cmd:
-        dbg(f"{BLUE}[QUICK]{RESET} Fallback '{QUICK_FALLBACK[1]}' -> {QUICK_FALLBACK[0]}")
-        return (QUICK_FALLBACK[0], QUICK_FALLBACK[2])
+    cmd_words = set(re.findall(r"\w+", cmd))
+
+    # Desk color (desk only); "desk" alone -> desk on
+    if "desk" in cmd_words:
+        for color in _KASA_COLORS:
+            if color in cmd_words or color in cmd:
+                return ("KASA_COLOR", "kasa_device", {"device": "desk", "color": color})
+        if "on" in cmd_words:
+            return ("KASA_DEVICE_ON", "kasa_device", {"device": "desk", "on": True})
+        if "off" in cmd_words:
+            return ("KASA_DEVICE_OFF", "kasa_device", {"device": "desk", "on": False})
+        # "desk" alone -> desk on (common shorthand)
+        return ("KASA_DEVICE_ON", "kasa_device", {"device": "desk", "on": True})
+
+    # Floor
+    if "floor" in cmd_words:
+        if "on" in cmd_words:
+            return ("KASA_DEVICE_ON", "kasa_device", {"device": "floor", "on": True})
+        if "off" in cmd_words:
+            return ("KASA_DEVICE_OFF", "kasa_device", {"device": "floor", "on": False})
+
+    # Both lights (light/lights or bare turn on/off)
+    has_light = "light" in cmd_words or "lights" in cmd_words
+    has_turn = "turn" in cmd_words
+    if has_light or has_turn:
+        if "on" in cmd_words:
+            return ("LIGHT_ON", "kasa_on", {})
+        if "off" in cmd_words:
+            return ("LIGHT_OFF", "kasa_off", {})
+
     return None
 
 
-def _run_quick_reaction(reaction: str) -> bool:
+def _parse_brightness(value: str) -> Optional[int]:
+    """Parse '100%', '50 percent', 'full', 'half', etc. -> 0-100 or None."""
+    value = value.strip().lower().replace(" percent", "%")
+    if value in _KASA_BRIGHTNESS_WORDS:
+        return _KASA_BRIGHTNESS_WORDS[value]
+    m = re.match(r"(\d+)\s*%?", value)
+    if m:
+        n = int(m.group(1))
+        return max(0, min(100, n))
+    return None
+
+
+def _run_quick_reaction(reaction: str, params: Optional[dict] = None) -> bool:
     """Dispatch quick command reaction. Returns True on success."""
+    params = params or {}
     if reaction == "kasa_on":
         return control_kasa_lights(on=True)
     if reaction == "kasa_off":
         return control_kasa_lights(on=False)
+    if reaction == "kasa_device":
+        device = params.get("device")
+        brightness = params.get("brightness")
+        color = params.get("color")
+        on = params.get("on")
+        if device:
+            if on is not None:
+                return control_kasa_device(device, on=on)
+            return control_kasa_device(device, brightness=brightness, color=color)
     return False
 
 
@@ -825,22 +900,22 @@ def query_ollama(prompt: str, history: Optional[list] = None) -> str:
     return text
 
 
-def ask_jarvis(text: str) -> bool:
-    """Layer 3 first (local actions), Layer 4 only if no match.
-    text: full utterance (include 'Jarvis' for LLM). COMMAND vs YOU based on Layer 3 match.
+def ask_jarvis(text: str, dur: float = 0) -> bool:
+    """Run quick command if matched (lights, floor, desk), else query LLM.
     Returns True if we gave a verbal LLM reply (enter conversation mode)."""
     global _chat_history
     m = match_quick_command(text)
     if m is not None:
-        name, reaction = m
+        name, reaction, params = m[0], m[1], m[2] if len(m) > 2 else {}
         print(f"{CYAN}COMMAND:{RESET} {name}")
-        ok = _run_quick_reaction(reaction)
+        ok = _run_quick_reaction(reaction, params)
         if not ok:
             err = "No Kasa devices found. Check they're on your network."
             print(f"{BLUE}[ERROR]{RESET} {err}\n")
             speak(err)
         return False
 
+    # No quick match → pass to LLM (short or long)
     print(f"{CYAN}YOU:{RESET} {text}")
     dbg(f"{YELLOW}[THINKING]{RESET}...")
     response = query_ollama(text, history=_chat_history)
@@ -887,11 +962,11 @@ def conversation():
         if not text or len(text) < 2:
             continue
         # Skip very short captures unless they match a quick command (reduces false triggers)
-        if dur < MIN_UTTERANCE_DURATION and match_quick_command(text) is None:
+        short_match = match_quick_command(text)
+        if dur < MIN_UTTERANCE_DURATION and short_match is None:
             continue
 
-        # Don't edit: pass full text including "Jarvis" to LLM
-        ask_jarvis(text)
+        ask_jarvis(text, dur=dur)
 
 
 # ── Raspberry Pi LED status ─────────────────────────────────────
@@ -1008,7 +1083,10 @@ def _run_wake_word_loop():
         pi_led_set_ready(False)   # Red = thinking/speaking
 
         save_wav(chunks, RAM_WAV)
-        text, dur = transcribe(RAM_WAV)
+        path = _trim_trailing_silence(RAM_WAV)
+        dur = _get_wav_duration(path)
+
+        text, dur = transcribe(path)  # tiny <3s (fast), base >=3s (accurate for conversation)
         if VAD_DEBUG_SAVE:
             _save_vad_debug(RAM_WAV, text)
         try:
@@ -1016,19 +1094,23 @@ def _run_wake_word_loop():
         except OSError:
             pass
         if not text:
+            dbg(f"{BLUE}[DEBUG]{RESET} Transcription empty, skipping")
             pi_led_set_ready(True)
             continue
-        if dur < MIN_UTTERANCE_DURATION and match_quick_command(text) is None:
+        short_match = match_quick_command(text)
+        if dur < MIN_UTTERANCE_DURATION and short_match is None:
+            dbg(f"{BLUE}[DEBUG]{RESET} Very short capture, no command match, skipping")
             pi_led_set_ready(True)
             continue
 
         command = extract_wake_command(text)
         if command is None:
+            dbg(f"{BLUE}[DEBUG]{RESET} No wake word in '{text}' — say 'Jarvis' first, skipping")
             pi_led_set_ready(True)
             continue
 
         if len(command) >= 2:
-            entered_conversation = ask_jarvis(text)
+            entered_conversation = ask_jarvis(text, dur=dur)
         else:
             speak("Yes?")
             entered_conversation = True
@@ -1041,7 +1123,11 @@ def _run_wake_word_loop():
 
 
 def main():
-    global _mic
+    global _mic, DEBUG
+    if "--debug" in sys.argv or os.environ.get("JARVIS_DEBUG"):
+        DEBUG = 1
+        if "--debug" in sys.argv:
+            sys.argv.remove("--debug")
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)

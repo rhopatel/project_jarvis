@@ -48,4 +48,6 @@ if [ ! -f "jarvis.py" ]; then
 fi
 
 # Run jarvis.py with all arguments passed to this script
+# Usage: ./run_jarvis.sh           # normal
+#        ./run_jarvis.sh --debug   # verbose (transcription, wake word, etc.)
 python jarvis.py "$@"
