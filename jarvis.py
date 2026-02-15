@@ -27,7 +27,7 @@ from typing import Optional
 DEBUG = 0  # 0 = clean (YOU/JARVIS only), 1 = verbose. Override: --debug or JARVIS_DEBUG=1
 VAD_DEBUG_SAVE     = 0            # 1 = save captured WAV to vad_captures/ (verify full command), 0 = off
 WAKE_WORD          = "Jarvis"
-SIMILARITY_THRESH = 0.35  # Wake word match (lower = more forgiving for mishearings)
+SIMILARITY_THRESH = 0.75  # Wake word match; raise to cut false positives (georgis/jorgas fixed in _JARVIS_LIKE)
 THRESHOLD          = 700         # RMS threshold for voice activity detection (calibrated)
 SILENCE_LIMIT = 1.1         # seconds of silence to end utterance
 SILENCE_LIMIT_CONV = 1.0    # Shorter in conversation so "light on" etc. stop sooner → use tiny model
@@ -291,7 +291,7 @@ def transcribe(path: str) -> tuple[str, float]:
 _JARVIS_LIKE = (
     "travis", "darvis", "charvis", "charvus", "charis", "garvis", "yarvis", "jarvin", "jarvus",
     "jarvis", "driver's", "drivers", "computer", "you",
-    "draw", "drop", "drive", "rose", "garbage",  # common Whisper tiny mishearings
+    "draw", "drop", "drive", "rose", "garbage", "georgis", "jorgas",  # Whisper mishearings
 )
 
 # Whisper mishearings of command phrases (apply after wake-word fix)
@@ -810,7 +810,6 @@ _CHAT_HISTORY_MAX = 10
 # Ollama connection: kept updated by background keepalive; quick commands work without it
 _ollama_connected = False
 _ollama_stop_event = threading.Event()
-OLLAMA_OFFLINE_MSG = "I cannot connect to your GPU, so I'm not able to reply with an intelligent response."
 OLLAMA_KEEPALIVE_INTERVAL = 15
 
 
@@ -927,8 +926,7 @@ def ask_jarvis(text: str, dur: float = 0) -> bool:
         print(f"{GREEN}JARVIS:{RESET} {response}\n")
         speak(response)
         return True  # Verbal reply → enter conversation mode
-    print(f"{BLUE}[ERROR]{RESET} {OLLAMA_OFFLINE_MSG}\n")
-    speak(OLLAMA_OFFLINE_MSG)
+    # No quick command, Ollama offline → silence
     return False
 
 
