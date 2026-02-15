@@ -30,6 +30,17 @@ export CUDA_VISIBLE_DEVICES=""
 # Ensure Python output is not buffered (important for non-TTY environments)
 export PYTHONUNBUFFERED=1
 
+# CPU performance mode (skip if no sudo)
+for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -f "$gov" ] && echo performance 2>/dev/null | sudo tee "$gov" >/dev/null
+done
+
+# Boost mic capture volume (tries first few ALSA cards)
+for c in 0 1 2 3 4 5; do
+    amixer -c $c set Capture 100% 2>/dev/null && break
+    amixer -c $c set Mic 100% 2>/dev/null && break
+done
+
 # Check if jarvis.py exists
 if [ ! -f "jarvis.py" ]; then
     echo "Error: jarvis.py not found in $SCRIPT_DIR"

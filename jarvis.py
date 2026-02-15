@@ -27,8 +27,9 @@ DEBUG              = 0            # 0 = clean (YOU/JARVIS only), 1 = verbose
 WAKE_WORD          = "Jarvis"
 SIMILARITY_THRESH  = 0.6
 THRESHOLD          = 1000        # RMS threshold for voice activity detection
-SILENCE_LIMIT      = 2.0         # seconds of silence to end an utterance
-PRE_AUDIO          = 0.5         # seconds of pre-roll kept before speech
+SILENCE_LIMIT      = 0.5         # seconds of silence (wake-word / quick commands)
+SILENCE_LIMIT_CONV = 1.2        # seconds of silence in conversation mode (longer pauses ok)
+PRE_AUDIO          = 0.25        # seconds of pre-roll before speech (minimal)
 CONVERSATION_TIMEOUT = 30        # seconds of no speech to exit conversation
 SILENCE_PAD_MS     = 150         # ms of silence prepended to TTS for USB sink wake
 #BARGEIN_THRESHOLD  = 1800        # RMS to trigger barge-in (above speaker bleed)
@@ -41,10 +42,13 @@ RATE               = 16000
 # Newer bulbs may need TP-Link account credentials - leave empty for older devices
 KASA_USERNAME      = ""  # e.g. "you@email.com" for Tapo/newer Kasa
 KASA_PASSWORD      = ""  # TP-Link cloud password
-# Voice phrases that control lights (first match wins)
-KASA_TRIGGERS      = [
-    (["turn on lights", "lights on", "switch on lights"], "on"),
-    (["turn off lights", "lights off", "switch off lights"], "off"),
+
+# Curated quick commands: (NAME, voice_phrases, reaction)
+# NAME: ALL_CAPS identifier shown when triggered
+# reaction: "kasa_on" | "kasa_off" | ... (dispatched below)
+QUICK_COMMANDS     = [
+    ("LIGHT_ON",  ["turn on lights", "lights on", "switch on lights", "light on"], "kasa_on"),
+    ("LIGHT_OFF", ["turn off lights", "lights off", "switch off lights", "light off"], "kasa_off"),
 ]
 CHUNK              = 1024
 
@@ -60,7 +64,12 @@ SYSTEM_PROMPT = (
 # ── Paths (fixed for this machine) ───────────────────────────
 
 WHISPER_BIN   = os.path.abspath("../whisper.cpp/build/bin/whisper-cli")
-WHISPER_MODEL = os.path.abspath("../whisper.cpp/models/ggml-tiny.en.bin")
+# Prefer quantized model (faster, smaller) - fallback to full if missing
+WHISPER_MODEL = os.path.abspath("../whisper.cpp/models/ggml-tiny.en-q4_0.bin")
+if not os.path.exists(WHISPER_MODEL):
+    WHISPER_MODEL = os.path.abspath("../whisper.cpp/models/ggml-tiny.en.bin")
+# Initial prompt biases transcription toward these phrases (reduces "lay on him" -> "light on" etc.)
+WHISPER_PROMPT = "Jarvis Jarvis light on lights off turn on turn off switch"
 
 
 def _detect_mic_device() -> str:
@@ -152,16 +161,59 @@ def play_wav(path: str):
 
 # ── Whisper transcription ────────────────────────────────────
 
+def _trim_trailing_silence(path: str, thresh: float = 800) -> str:
+    """Trim trailing silence from WAV to reduce whisper processing time. Returns path."""
+    try:
+        with wave.open(path, "rb") as wf:
+            nch, sw, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+        n = len(frames) // (sw * nch)
+        if n < 2:
+            return path
+        chunk_sz = int(rate * 0.02)  # 20ms chunks
+        trim_end = n
+        quiet_chunks = 0
+        need_quiet = int(0.25 * rate / chunk_sz)  # 250ms silence = cut
+        for i in range(n - chunk_sz, 0, -chunk_sz):
+            chunk = frames[i * sw * nch : (i + chunk_sz) * sw * nch]
+            if len(chunk) < chunk_sz * sw * nch:
+                break
+            rms = get_rms(chunk)
+            if rms < thresh:
+                quiet_chunks += 1
+                if quiet_chunks >= need_quiet:
+                    trim_end = i + chunk_sz
+                    break
+            else:
+                quiet_chunks = 0
+        min_samples = int(rate * 0.5)  # Keep at least 0.5s
+        if trim_end < n * 0.9 and trim_end >= min_samples:
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(nch)
+                wf.setsampwidth(sw)
+                wf.setframerate(rate)
+                wf.writeframes(frames[: trim_end * sw * nch])
+    except Exception:
+        pass
+    return path
+
+
 def transcribe(path: str) -> str:
     """Run whisper.cpp on a WAV file and return cleaned text."""
+    path = _trim_trailing_silence(path)
     t0 = time.time()
+    nthreads = min(4, (os.cpu_count() or 4))
+    cmd = [
+        WHISPER_BIN, "-m", WHISPER_MODEL, "-f", path,
+        "-t", str(nthreads), "-bs", "1", "-bo", "1",
+        "-ml", "32",  # Short commands only
+        "--no-timestamps", "-l", "en",
+    ]
+    if WHISPER_PROMPT:
+        cmd.extend(["--prompt", WHISPER_PROMPT])
     try:
         r = subprocess.run(
-            [
-                WHISPER_BIN, "-m", WHISPER_MODEL, "-f", path,
-                "-t", "4", "-bs", "1", "-bo", "1",
-                "--no-timestamps", "-l", "en",
-            ],
+            cmd,
             capture_output=True, text=True, timeout=30, env=_whisper_env,
         )
     except subprocess.TimeoutExpired:
@@ -174,7 +226,22 @@ def transcribe(path: str) -> str:
         return ""
 
     # Strip whisper artefacts: [blank_audio], (silence), etc.
-    return re.sub(r"\[.*?\]|\(.*?\)", "", r.stdout).strip()
+    text = re.sub(r"\[.*?\]|\(.*?\)", "", r.stdout).strip()
+    # Fix common mishearings of "Jarvis" at start (e.g. "driver's light off")
+    text = _fix_jarvis_mishearing(text)
+    return text
+
+
+def _fix_jarvis_mishearing(text: str) -> str:
+    """Replace common mishearings of 'Jarvis' at sentence start."""
+    if not text or len(text) < 5:
+        return text
+    lowered = text.lower()
+    # "driver's", "drivers", "driver is" etc. at start -> "Jarvis"
+    for mis in (r"^driver'?s?\s+", r"^drivers\s+", r"^driver\s+is\s+"):
+        if re.search(mis, lowered):
+            return "Jarvis " + re.sub(mis, "", text, flags=re.I).strip()
+    return text
 
 
 # ── Text helpers ──────────────────────────────────────────────
@@ -290,6 +357,11 @@ def speak(text: str):
         dbg(f"{BLUE}[DEBUG]{RESET} WAV saved: {dst}")
 
     play_wav(TTS_WAV)
+    for p in (TTS_WAV, TTS_RAW_WAV):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 # ── Microphone / VAD ─────────────────────────────────────────
@@ -310,10 +382,11 @@ def wait_for_silence(settle: float = 0.5):
             quiet_since = None
 
 
-def wait_for_speech(timeout: float = None) -> list:
+def wait_for_speech(timeout: float = None, silence_limit: float = SILENCE_LIMIT) -> list:
     """Block until speech is detected, record until silence returns.
 
     Returns the list of audio chunks, or [] on timeout / stream end.
+    silence_limit: seconds of silence to end utterance (shorter = faster cut-off).
     """
     pre = collections.deque(maxlen=int(RATE / CHUNK * PRE_AUDIO))
     chunks = []
@@ -340,7 +413,7 @@ def wait_for_speech(timeout: float = None) -> list:
             chunks.append(chunk)
             if silence_start is None:
                 silence_start = time.time()
-            elif time.time() - silence_start >= SILENCE_LIMIT:
+            elif time.time() - silence_start >= silence_limit:
                 return chunks
         else:
             # Still waiting for speech
@@ -423,45 +496,51 @@ def control_kasa_lights(on: bool) -> bool:
             pass
         await dev.update()
 
+    async def _control_one(ip: str, alias: str):
+        try:
+            dev = await Discover.discover_single(ip, credentials=_kasa_creds)
+            await dev.update()
+            if on:
+                await _turn_on_dev(dev)
+            else:
+                await dev.turn_off()
+            return True
+        except Exception as e:
+            dbg(f"{BLUE}[KASA]{RESET} {alias}: {e}")
+            return False
+
     async def _control():
-        ok = False
-        for i, (ip, alias, model) in enumerate(_kasa_devices):
-            try:
-                dev = await Discover.discover_single(ip, credentials=_kasa_creds)
-                await dev.update()
-                if on:
-                    await _turn_on_dev(dev)
-                else:
-                    await dev.turn_off()
-                ok = True
-            except Exception as e:
-                dbg(f"{BLUE}[KASA]{RESET} {alias}: {e}")
-                try:
-                    await asyncio.sleep(2)
-                    dev = await Discover.discover_single(ip, credentials=_kasa_creds)
-                    if on:
-                        await _turn_on_dev(dev)
-                    else:
-                        await dev.turn_off()
-                    ok = True
-                except Exception:
-                    pass
-            if i < len(_kasa_devices) - 1:
-                await asyncio.sleep(2)
-        return ok
+        results = await asyncio.gather(
+            *(_control_one(ip, alias) for ip, alias, _ in _kasa_devices)
+        )
+        return any(results)
 
     return asyncio.run(_control())
 
 
-def match_kasa_trigger(command: str) -> Optional[str]:
-    """If command matches a Kasa trigger phrase, return 'on' or 'off'. Else None."""
-    cmd = command.lower().strip()
-    for phrases, action in KASA_TRIGGERS:
+# ── Command routing (layered) ─────────────────────────────────────────
+# Layer 3: Local actions (Kasa, etc.) - runs on Pi, no PC needed
+# Layer 4: Ollama LLM - only if Layer 3 does not match
+
+
+def match_quick_command(text: str) -> Optional[tuple]:
+    """If text matches a quick command phrase, return (NAME, reaction). Else None."""
+    cmd = text.lower().strip()
+    for name, phrases, reaction in QUICK_COMMANDS:
         for phrase in phrases:
             if phrase in cmd:
-                dbg(f"{BLUE}[KASA]{RESET} Matched '{phrase}' -> {action}")
-                return action
+                dbg(f"{BLUE}[QUICK]{RESET} Matched '{phrase}' -> {name}")
+                return (name, reaction)
     return None
+
+
+def _run_quick_reaction(reaction: str) -> bool:
+    """Dispatch quick command reaction. Returns True on success."""
+    if reaction == "kasa_on":
+        return control_kasa_lights(on=True)
+    if reaction == "kasa_off":
+        return control_kasa_lights(on=False)
+    return False
 
 
 def query_ollama(prompt: str) -> str:
@@ -492,28 +571,28 @@ def query_ollama(prompt: str) -> str:
     return text
 
 
-def ask_jarvis(command: str) -> bool:
-    """Print the user's command. If Kasa trigger matches, control lights directly.
-    Otherwise query Ollama and speak the reply.
+def ask_jarvis(text: str) -> bool:
+    """Layer 3 first (local actions), Layer 4 only if no match.
+    text: full utterance (include 'Jarvis' for LLM). COMMAND vs YOU based on Layer 3 match.
+    Returns True if we gave a verbal LLM reply (enter conversation mode)."""
+    m = match_quick_command(text)
+    if m is not None:
+        name, reaction = m
+        print(f"{CYAN}COMMAND:{RESET} {name}")
+        ok = _run_quick_reaction(reaction)
+        if not ok:
+            err = "No Kasa devices found. Check they're on your network."
+            print(f"{BLUE}[ERROR]{RESET} {err}\n")
+            speak(err)
+        return False
 
-    Returns True if the user interrupted Jarvis mid-speech.
-    """
-    print(f"{CYAN}YOU:{RESET} {command}")
-    action = match_kasa_trigger(command)
-    if action:
-        ok = control_kasa_lights(on=(action == "on"))
-        if ok:
-            reply = "Turning on the lights." if action == "on" else "Turning off the lights."
-            print(f"{GREEN}JARVIS:{RESET} {reply}\n")
-            return speak(reply)
-        else:
-            print(f"{BLUE}[ERROR]{RESET} No Kasa devices found. Check they're on your network.\n")
-
+    print(f"{CYAN}YOU:{RESET} {text}")
     dbg(f"{YELLOW}[THINKING]{RESET}...")
-    response = query_ollama(command)
+    response = query_ollama(text)
     if response:
         print(f"{GREEN}JARVIS:{RESET} {response}\n")
-        return speak(response)
+        speak(response)
+        return True  # Verbal reply → enter conversation mode
     return False
 
 
@@ -529,22 +608,22 @@ def conversation():
 
         dbg(f"{YELLOW}[CONVERSATION]{RESET} Listening...")
 
-        chunks = wait_for_speech(timeout=CONVERSATION_TIMEOUT)
+        chunks = wait_for_speech(timeout=CONVERSATION_TIMEOUT, silence_limit=SILENCE_LIMIT_CONV)
         if not chunks:
             dbg(f"{BLUE}[INFO]{RESET} Conversation timeout.")
             return
 
         save_wav(chunks, RAM_WAV)
         text = transcribe(RAM_WAV)
-
+        try:
+            os.remove(RAM_WAV)
+        except OSError:
+            pass
         if not text or len(text) < 2:
             continue
 
-        command = strip_wake_word(text)
-        if len(command) < 2:
-            continue
-
-        ask_jarvis(command)
+        # Don't edit: pass full text including "Jarvis" to LLM
+        ask_jarvis(text)
 
 
 # ── Cleanup ───────────────────────────────────────────────────
@@ -606,6 +685,10 @@ def main():
 
     print(f"{GREEN}Jarvis ready.{RESET}\n")
 
+    # Pre-warm Kasa discovery in background (first light command will be faster)
+    import threading
+    threading.Thread(target=_kasa_discover, daemon=True).start()
+
     # ── Wake-word loop ────────────────────────────────────────
     while True:
         chunks = wait_for_speech()
@@ -614,6 +697,10 @@ def main():
 
         save_wav(chunks, RAM_WAV)
         text = transcribe(RAM_WAV)
+        try:
+            os.remove(RAM_WAV)
+        except OSError:
+            pass
         if not text:
             continue
 
@@ -622,15 +709,17 @@ def main():
             continue
 
         if len(command) >= 2:
-            ask_jarvis(command)
+            entered_conversation = ask_jarvis(text)
         else:
             speak("Yes?")
+            entered_conversation = True
 
-        # Enter conversation mode (no wake word needed)
-        dbg(f"{GREEN}[CONVERSATION]{RESET} Active")
-        conversation()
-        wait_for_silence()
-        dbg(f"{YELLOW}[LISTENING]{RESET} Wake word mode")
+        # Conversation mode only when Jarvis gave a verbal reply (LLM or "Yes?")
+        if entered_conversation:
+            dbg(f"{GREEN}[CONVERSATION]{RESET} Active")
+            conversation()
+            wait_for_silence()
+            dbg(f"{YELLOW}[LISTENING]{RESET} Wake word mode")
 
 
 if __name__ == "__main__":
