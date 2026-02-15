@@ -2,4 +2,5 @@
 tts_debug/**
 vad_captures/**
 vad_test/**
+test_tts_cutoff/saved_wavs/**
 .env

@@ -144,7 +144,17 @@ The service waits for network (Kasa, Ollama) and audio before starting, and rest
 
 ### Raspberry Pi LED Indicator
 
-When Jarvis is running, the red PWR LED stays **solid**. When Jarvis stops, the LED reverts to normal. This requires write access to `/sys/class/leds/`. If running as a normal user, LED control may fail silently; the assistant still works. To enable LED on a system service, you can add a udev rule or run the service as root (not recommended for audio).
+When Jarvis is running, the red PWR LED stays **solid**. When Jarvis stops, the LED reverts to normal.
+
+**LED control requires root.** The service runs as your user for speaker/audio, so the LED won't change. Run `sudo ./run_jarvis.sh` manually if you want the red PWR LED solid while Jarvis runs.
+
+### Systemd: Disable, Restart, Reinstall
+
+| Goal | Commands |
+|------|----------|
+| **Stop and disable** (no auto-start) | `sudo systemctl stop jarvis` then `sudo systemctl disable jarvis` |
+| **Apply code changes** (no reinstall) | `sudo systemctl restart jarvis` |
+| **Reinstall** (new paths/user, updated service file) | `sudo ./install_service.sh` then `sudo systemctl daemon-reload` and `sudo systemctl restart jarvis` |
 
 ## Configuration
 
@@ -187,6 +197,9 @@ PIPER_VOICE_NAME = "en_US-lessac-medium"
 - Check firewall settings
 - Update `PC_IP` if different
 
+### Service Runs but No Audio
+The service runs as your user with `XDG_RUNTIME_DIR` for PipeWire. Ensure you're logged in (desktop session) when the service starts. If audio still fails, check `journalctl -u jarvis -f` for errors.
+
 ### TTS Not Working
 - Install espeak as fallback: `sudo apt-get install espeak espeak-data`
 - Check Piper TTS installation: `python -m piper_tts --help`
@@ -201,7 +214,7 @@ PIPER_VOICE_NAME = "en_US-lessac-medium"
 
 - `jarvis.py` - Main voice assistant script
 - `run_jarvis.sh` - Wrapper script (auto-activates venv and runs jarvis.py)
-- `jarvis.service` - systemd unit for auto-start
+- `jarvis.service` - systemd unit for auto-start on boot
 - `install_service.sh` - Installs the systemd service
 - `jarvis_silent.py` - Console-only version (reference)
 - `requirements.txt` - Python dependencies

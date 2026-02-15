@@ -2,18 +2,25 @@
 Description=Jarvis Voice Assistant
 After=network-online.target sound.target
 Wants=network-online.target
-# Wait for actual network (Kasa, Ollama) and audio (mic, speakers)
+# If using desktop + PipeWire: add graphical.target to After and a short delay below
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
 Type=simple
-# Change User to your Raspberry Pi username (e.g. pi, rohan)
+# Run as your user for audio (PulseAudio/PipeWire needs user session).
+# LED control requires root and won't work; run manually with sudo for LED.
 User=pi
 Group=pi
 
+# So paplay can find PipeWire socket (install script substitutes UID)
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+
 # Project directory - update path if your project lives elsewhere
 WorkingDirectory=/home/pi/Documents/project_jarvis
+
+# Brief delay so PipeWire has time to start (desktop boot)
+ExecStartPre=/bin/sleep 10
 
 # Run the wrapper script (activates venv, sets env, runs jarvis.py)
 ExecStart=/home/pi/Documents/project_jarvis/run_jarvis.sh

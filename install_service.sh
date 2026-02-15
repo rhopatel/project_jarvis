@@ -14,14 +14,16 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Create a copy with the correct paths substituted
+# Create a copy with correct paths, user, and XDG_RUNTIME_DIR (for PipeWire)
+SERVICE_UID=$(id -u "$SERVICE_USER")
 sed -e "s|/home/pi/Documents/project_jarvis|$SCRIPT_DIR|g" \
     -e "s|^User=.*|User=$SERVICE_USER|" \
     -e "s|^Group=.*|Group=$(id -gn "$SERVICE_USER")|" \
+    -e "s|/run/user/1000|/run/user/$SERVICE_UID|" \
     "$SERVICE_FILE" > "$SYSTEMD_DIR/jarvis.service"
 
 echo "Installed jarvis.service to $SYSTEMD_DIR"
-echo "  User: $SERVICE_USER"
+echo "  User: $SERVICE_USER (for speaker/audio)"
 echo "  WorkingDirectory: $SCRIPT_DIR"
 echo ""
 echo "Enable and start:"

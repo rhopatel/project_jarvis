@@ -29,11 +29,10 @@ VAD_DEBUG_SAVE     = 0            # 1 = save captured WAV to vad_captures/ (veri
 WAKE_WORD          = "Jarvis"
 SIMILARITY_THRESH  = 0.6
 THRESHOLD          = 1000        # RMS threshold for voice activity detection
-SILENCE_LIMIT      = 0.7         # seconds of silence (0.5 was cutting off "light on")
-SILENCE_LIMIT_CONV = 1.2        # seconds of silence in conversation mode (longer pauses ok)
+SILENCE_LIMIT      = 1.1         # seconds of silence to end utterance (avoid cutting off "how's it going today")
+SILENCE_LIMIT_CONV = 1.5        # seconds of silence in conversation mode (allow natural pauses)
 PRE_AUDIO          = 0.25        # seconds of pre-roll before speech (minimal)
 CONVERSATION_TIMEOUT = 30        # seconds of no speech to exit conversation
-SILENCE_PAD_MS     = 150         # ms of silence prepended to TTS for USB sink wake
 #BARGEIN_THRESHOLD  = 1800        # RMS to trigger barge-in (above speaker bleed)
 #BARGEIN_CHUNKS     = 3           # consecutive loud chunks needed (~200ms, prevents false triggers)
 OLLAMA_IP          = "10.0.0.224"
@@ -157,10 +156,12 @@ def save_wav(chunks: list, path: str):
 
 
 def play_wav(path: str):
-    """Play a WAV through PipeWire/PulseAudio while monitoring the mic.
-
-    """
-    subprocess.run(["paplay", path], stderr=subprocess.DEVNULL, timeout=120)
+    """Play a WAV. Prefer paplay (PipeWire/Pulse); fall back to aplay (ALSA) for system service."""
+    r = subprocess.run(
+        ["paplay", path], capture_output=True, timeout=120,
+    )
+    if r.returncode != 0:
+        subprocess.run(["aplay", "-q", path], stderr=subprocess.DEVNULL, timeout=120)
 
 
 # ── Whisper transcription ────────────────────────────────────
@@ -361,17 +362,17 @@ def speak(text: str):
     with wave.open(TTS_RAW_WAV, "wb") as wf:
         _tts_voice.synthesize_wav(text, wf, syn_config=cfg)
 
-    # Read it back, prepend silence for USB sink wake-up, write final WAV
+    # Read it back, prepend duplicate of first 150ms (USB speaker drops start; dup gets cut)
     with wave.open(TTS_RAW_WAV, "rb") as rf:
         params = rf.getparams()
         audio  = rf.readframes(rf.getnframes())
 
-    pad_bytes = int(params.framerate * SILENCE_PAD_MS / 1000) * params.sampwidth * params.nchannels
-    pad = b"\x00" * pad_bytes
-
+    dup_ms = 150
+    dup_bytes = int(params.framerate * dup_ms / 1000) * params.sampwidth * params.nchannels
+    dup = audio[:dup_bytes]
     with wave.open(TTS_WAV, "wb") as wf:
         wf.setparams(params)
-        wf.writeframes(pad + audio)
+        wf.writeframes(dup + audio)
 
     # Debug: keep a copy
     if DEBUG:
@@ -710,8 +711,9 @@ def _pi_led_set_running(running: bool):
                 elif _PI_LED_PWR == led and _PI_LED_SAVED_TRIGGER:
                     with open(trigger_path, "w") as f:
                         f.write(_PI_LED_SAVED_TRIGGER)
-            except (OSError, PermissionError):
-                pass
+            except (OSError, PermissionError) as e:
+                if DEBUG:
+                    dbg(f"{BLUE}[LED]{RESET} Cannot control Pi LED (need root?): {e}")
             break
 
 
