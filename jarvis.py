@@ -10,6 +10,7 @@ import struct
 import math
 import time
 import sys
+import threading
 import wave
 import collections
 import requests
@@ -17,7 +18,6 @@ import json
 import signal
 import atexit
 import re
-import select
 import tempfile
 from typing import Optional
 
@@ -34,8 +34,7 @@ SILENCE_LIMIT_CONV = 1.5        # seconds of silence in conversation mode (allow
 PRE_AUDIO          = 0.25        # seconds of pre-roll before speech (minimal)
 CONVERSATION_TIMEOUT = 30        # seconds of no speech to exit conversation
 MIN_UTTERANCE_DURATION = 0.25     # seconds: ignore captures shorter than this (reduces false triggers like "you")
-#BARGEIN_THRESHOLD  = 1800        # RMS to trigger barge-in (above speaker bleed)
-#BARGEIN_CHUNKS     = 3           # consecutive loud chunks needed (~200ms, prevents false triggers)
+# Barge-in (interrupt TTS): uncomment and implement in conversation() if needed
 OLLAMA_IP          = "10.0.0.224"
 OLLAMA_MODEL       = "gemma3:12b"      # Best overall assistant
 RATE               = 16000
@@ -55,21 +54,37 @@ QUICK_COMMANDS     = [
 QUICK_FALLBACK    = ("LIGHT_ON", "light", "kasa_on")
 CHUNK              = 1024
 
-SYSTEM_PROMPT = (
-    "You are Jarvis, a helpful AI assistant and coding expert. "
-    "You are running in 'Voice Mode'. "
-    "Your responses should be concise, natural, and conversational. "
-    "Speak as if you're having a conversation. "
-    "Do not use markdown formatting or special characters. "
-    "Remember the conversation context and refer back to earlier topics when the user says 'it' or 'that'."
+# System prompt: load from system_prompt.txt (gitignored) or use default
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SYSTEM_PROMPT_PATH = os.path.join(_SCRIPT_DIR, "system_prompt.txt")
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are Jarvis, a helpful voice assistant. "
+    "Keep responses short and concise unless asked to elaborate."
 )
 
 
-# ── Paths (fixed for this machine) ───────────────────────────
+def _load_system_prompt() -> str:
+    """Load system prompt from system_prompt.txt if it exists, else use default."""
+    try:
+        if os.path.isfile(_SYSTEM_PROMPT_PATH):
+            with open(_SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+                if text:
+                    return text
+    except Exception:
+        pass
+    return _DEFAULT_SYSTEM_PROMPT
 
-WHISPER_BIN   = os.path.abspath("../whisper.cpp/build/bin/whisper-cli")
-WHISPER_MODEL_FAST     = os.path.abspath("../whisper.cpp/models/ggml-tiny.en-q4_0.bin")  # <2s: quick commands
-WHISPER_MODEL_ACCURATE = os.path.abspath("../whisper.cpp/models/ggml-base.en-q4_0.bin")  # >=2s: conversation
+
+SYSTEM_PROMPT = _load_system_prompt()
+
+
+# ── Paths (relative to script, works regardless of cwd) ───────
+
+_WHISPER_BASE = os.path.join(_SCRIPT_DIR, "..", "whisper.cpp")
+WHISPER_BIN = os.path.join(_WHISPER_BASE, "build", "bin", "whisper-cli")
+WHISPER_MODEL_FAST = os.path.join(_WHISPER_BASE, "models", "ggml-tiny.en-q4_0.bin")      # <2s: quick commands
+WHISPER_MODEL_ACCURATE = os.path.join(_WHISPER_BASE, "models", "ggml-base.en-q4_0.bin")  # >=2s: conversation
 WHISPER_SHORT_THRESH   = 2.0  # seconds: use fast model below this, accurate above
 # Initial prompt biases transcription toward these phrases (reduces "lay on him" -> "light on" etc.)
 WHISPER_PROMPT = "Jarvis Jarvis light on lights off turn on turn off switch"
@@ -94,9 +109,9 @@ def _detect_mic_device() -> str:
 
 
 MIC_DEVICE = _detect_mic_device()
-RAM_WAV       = "/dev/shm/jarvis_vad.wav"
-TTS_WAV       = "/dev/shm/jarvis_tts.wav"
-TTS_RAW_WAV   = "/dev/shm/jarvis_tts_raw.wav"
+RAM_WAV = "/dev/shm/jarvis_vad.wav"
+TTS_RAW_WAV = "/dev/shm/jarvis_tts_raw.wav"   # TTS synthesis temp (RAM disk)
+TTS_WAV = "/dev/shm/jarvis_tts.wav"           # TTS output with dup (RAM disk)
 
 PIPER_VOICE     = "en_US-ryan-high"  # Higher quality; fallback to medium if high missing
 PIPER_VOICE_DIR = os.path.expanduser("~/.local/share/piper/voices")
@@ -105,8 +120,8 @@ PIPER_VOICE_DIR = os.path.expanduser("~/.local/share/piper/voices")
 # ── Whisper subprocess environment (built once) ──────────────
 
 _whisper_env = os.environ.copy()
-for _d in ["../whisper.cpp/build/src", "../whisper.cpp/build/ggml/src"]:
-    _abs = os.path.abspath(_d)
+for _d in ["build/src", "build/ggml/src"]:
+    _abs = os.path.join(_WHISPER_BASE, _d)
     if os.path.isdir(_abs):
         _whisper_env["LD_LIBRARY_PATH"] = (
             _abs + ":" + _whisper_env.get("LD_LIBRARY_PATH", "")
@@ -287,6 +302,7 @@ def _fix_lights_mishearing(text: str) -> str:
         (r"(turn\s+on\s+the\s+)live\b", r"\g<1>lights"),
         (r"(turn\s+off\s+the\s+)life\b", r"\g<1>lights"),
         (r"(turn\s+on\s+the\s+)life\b", r"\g<1>lights"),
+        (r"turn\s+all\s+the\s+way\b", "turn off the lights"),
     ]:
         if re.search(pattern, lowered):
             return re.sub(pattern, replacement, text, flags=re.I)
@@ -407,35 +423,29 @@ def speak(text: str):
     cfg = SynthesisConfig(speaker_id=None, volume=0.25)
     sentences = _split_sentences(text)
 
-    for i, sent in enumerate(sentences):
+    for sent in sentences:
         if not sent.strip():
             continue
-        raw_path = tempfile.mktemp(suffix=".wav", prefix="jarvis_tts_raw_")
-        out_path = tempfile.mktemp(suffix=".wav", prefix="jarvis_tts_")
         try:
-            with wave.open(raw_path, "wb") as wf:
+            with wave.open(TTS_RAW_WAV, "wb") as wf:
                 _tts_voice.synthesize_wav(sent, wf, syn_config=cfg)
-            with wave.open(raw_path, "rb") as rf:
+            with wave.open(TTS_RAW_WAV, "rb") as rf:
                 params = rf.getparams()
                 audio = rf.readframes(rf.getnframes())
-            dup_ms = 150 if i == 0 else 0
+            dup_ms = 150  # USB speaker cuts start; prepend dup so each sentence is audible
             if dup_ms > 0:
                 dup_bytes = int(params.framerate * dup_ms / 1000) * params.sampwidth * params.nchannels
                 dup = audio[:min(dup_bytes, len(audio))]
-                with wave.open(out_path, "wb") as wf:
+                with wave.open(TTS_WAV, "wb") as wf:
                     wf.setparams(params)
                     wf.writeframes(dup + audio)
             else:
-                with wave.open(out_path, "wb") as wf:
+                with wave.open(TTS_WAV, "wb") as wf:
                     wf.setparams(params)
                     wf.writeframes(audio)
-            play_wav(out_path)
-        finally:
-            for p in (raw_path, out_path):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+            play_wav(TTS_WAV)
+        except OSError:
+            pass
 
 
 # ── Microphone / VAD ─────────────────────────────────────────
@@ -677,9 +687,68 @@ def _run_quick_reaction(reaction: str) -> bool:
 _chat_history: list = []
 _CHAT_HISTORY_MAX = 10
 
+# Ollama connection: kept updated by background keepalive; quick commands work without it
+_ollama_connected = False
+_ollama_stop_event = threading.Event()
+OLLAMA_OFFLINE_MSG = "I cannot connect to your GPU, so I'm not able to reply with an intelligent response."
+OLLAMA_KEEPALIVE_INTERVAL = 15
+
+
+def _check_ollama() -> bool:
+    """Verify Ollama is reachable and our model exists. Returns True on success."""
+    try:
+        r = requests.get(f"http://{OLLAMA_IP}:11434/api/tags", timeout=5)
+        if r.status_code != 200:
+            return False
+        models = r.json().get("models", [])
+        want = OLLAMA_MODEL.split(":")[0]
+        return any(m.get("name", "").startswith(want) for m in models)
+    except requests.exceptions.RequestException:
+        return False
+
+
+def _warm_ollama_model() -> None:
+    """Send a minimal request to load the model and prime it with the system prompt."""
+    try:
+        url = f"http://{OLLAMA_IP}:11434/api/chat"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": "Hi"},
+            ],
+            "stream": True,
+        }
+        with requests.post(url, json=payload, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                try:
+                    if json.loads(line).get("done"):
+                        break
+                except json.JSONDecodeError:
+                    pass
+    except requests.exceptions.RequestException:
+        pass
+
+
+def _ollama_keepalive_loop() -> None:
+    """Background thread: periodically check Ollama, warm model when first connected."""
+    global _ollama_connected
+    last_connected = False
+    while not _ollama_stop_event.wait(OLLAMA_KEEPALIVE_INTERVAL):
+        connected = _check_ollama()
+        _ollama_connected = connected
+        if connected and not last_connected:
+            dbg(f"{GREEN}[OLLAMA]{RESET} Connected, warming model...")
+            _warm_ollama_model()
+        last_connected = connected
+
 
 def query_ollama(prompt: str, history: Optional[list] = None) -> str:
-    """Send prompt to Ollama chat API with conversation history. Returns assistant response."""
+    """Send prompt to Ollama chat API with conversation history. Returns assistant response or '' on failure."""
+    global _ollama_connected
     url = f"http://{OLLAMA_IP}:11434/api/chat"
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
@@ -688,9 +757,11 @@ def query_ollama(prompt: str, history: Optional[list] = None) -> str:
     messages.append({"role": "user", "content": prompt})
     payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": True}
     text = ""
+    timeout = 60 if _ollama_connected else 5
     try:
-        with requests.post(url, json=payload, stream=True, timeout=60) as r:
+        with requests.post(url, json=payload, stream=True, timeout=timeout) as r:
             r.raise_for_status()
+            _ollama_connected = True
             for line in r.iter_lines():
                 if not line:
                     continue
@@ -704,6 +775,7 @@ def query_ollama(prompt: str, history: Optional[list] = None) -> str:
                 except json.JSONDecodeError:
                     continue
     except requests.exceptions.RequestException as e:
+        _ollama_connected = False
         print(f"{BLUE}[ERROR]{RESET} Ollama: {e}")
     return text
 
@@ -735,6 +807,8 @@ def ask_jarvis(text: str) -> bool:
         print(f"{GREEN}JARVIS:{RESET} {response}\n")
         speak(response)
         return True  # Verbal reply → enter conversation mode
+    print(f"{BLUE}[ERROR]{RESET} {OLLAMA_OFFLINE_MSG}\n")
+    speak(OLLAMA_OFFLINE_MSG)
     return False
 
 
@@ -743,10 +817,10 @@ def ask_jarvis(text: str) -> bool:
 def conversation():
     """After wake word, keep talking without repeating 'Jarvis'.
     Exits after CONVERSATION_TIMEOUT seconds of silence.
-
     """
     while True:
         wait_for_silence()
+        pi_led_set_ready(True)   # Green = listening for next utterance
 
         dbg(f"{YELLOW}[CONVERSATION]{RESET} Listening...")
 
@@ -755,6 +829,7 @@ def conversation():
             dbg(f"{BLUE}[INFO]{RESET} Conversation timeout.")
             _chat_history.clear()  # Fresh context for next session
             return
+        pi_led_set_ready(False)   # Red = thinking/speaking
 
         save_wav(chunks, RAM_WAV)
         text, dur = transcribe(RAM_WAV)
@@ -775,52 +850,90 @@ def conversation():
 
 
 # ── Raspberry Pi LED status ─────────────────────────────────────
+# Green = ready to listen. Red = thinking/speaking. Requires root.
 
-_PI_LED_PWR = None
-_PI_LED_SAVED_TRIGGER = None
+_PI_LED_GREEN = None   # ACT/led0 - ready state
+_PI_LED_RED = None     # PWR/led1 - busy state
+_PI_LED_SAVED = {}     # {led_path: original_trigger}
+_PI_LED_OK = False     # True if both LEDs found and we have permission
 
 
-def _pi_led_set_running(running: bool):
-    """Set the Pi's PWR (red) LED: solid on = Jarvis running, restore default on exit.
-    Fails silently if not on a Pi or without permission.
-    """
-    global _PI_LED_PWR, _PI_LED_SAVED_TRIGGER
+def _pi_led_init() -> bool:
+    """Discover green (ACT) and red (PWR) LEDs. Save triggers. Returns True if both found."""
+    global _PI_LED_GREEN, _PI_LED_RED, _PI_LED_SAVED
     base = "/sys/class/leds"
     if not os.path.isdir(base):
-        return
+        return False
+    green_candidates = ["act", "led0", "green"]
+    red_candidates = ["pwr", "power", "led1", "red"]
     for name in os.listdir(base):
-        if "pwr" in name.lower() or "power" in name.lower() or name == "led1":
-            led = os.path.join(base, name)
-            trigger_path = os.path.join(led, "trigger")
-            brightness_path = os.path.join(led, "brightness")
-            if not os.path.isfile(trigger_path):
-                continue
-            try:
-                if running:
-                    with open(trigger_path) as f:
-                        raw = f.read()
-                    m = re.search(r"\[(\w+)\]", raw)
-                    _PI_LED_SAVED_TRIGGER = m.group(1) if m else "input"
-                    _PI_LED_PWR = led
-                    with open(trigger_path, "w") as f:
-                        f.write("none\n")
-                    if os.path.isfile(brightness_path):
-                        with open(brightness_path, "w") as f:
-                            f.write("1\n")
-                elif _PI_LED_PWR == led and _PI_LED_SAVED_TRIGGER:
-                    with open(trigger_path, "w") as f:
-                        f.write(_PI_LED_SAVED_TRIGGER)
-            except (OSError, PermissionError) as e:
-                if DEBUG:
-                    dbg(f"{BLUE}[LED]{RESET} Cannot control Pi LED (need root?): {e}")
-            break
+        led = os.path.join(base, name)
+        trigger_path = os.path.join(led, "trigger")
+        brightness_path = os.path.join(led, "brightness")
+        if not os.path.isfile(trigger_path) or not os.path.isfile(brightness_path):
+            continue
+        lower = name.lower()
+        try:
+            with open(trigger_path) as f:
+                raw = f.read()
+            m = re.search(r"\[(\w+)\]", raw)
+            saved = m.group(1) if m else "input"
+            if any(c in lower for c in green_candidates) and _PI_LED_GREEN is None:
+                _PI_LED_GREEN = led
+                _PI_LED_SAVED[led] = saved
+            elif any(c in lower for c in red_candidates) and _PI_LED_RED is None:
+                _PI_LED_RED = led
+                _PI_LED_SAVED[led] = saved
+        except (OSError, PermissionError):
+            pass
+    global _PI_LED_OK
+    _PI_LED_OK = _PI_LED_GREEN is not None and _PI_LED_RED is not None
+    return _PI_LED_OK
+
+
+def _pi_led_set(led_path: str, on: bool):
+    """Set one LED solid on or off."""
+    if not led_path:
+        return
+    trigger_path = os.path.join(led_path, "trigger")
+    brightness_path = os.path.join(led_path, "brightness")
+    try:
+        with open(trigger_path, "w") as f:
+            f.write("none\n")
+        with open(brightness_path, "w") as f:
+            f.write("1\n" if on else "0\n")
+    except (OSError, PermissionError):
+        pass
+
+
+def _pi_led_restore():
+    """Restore both LEDs to their original triggers (on exit)."""
+    for led_path, trigger in _PI_LED_SAVED.items():
+        try:
+            with open(os.path.join(led_path, "trigger"), "w") as f:
+                f.write(trigger + "\n")
+        except (OSError, PermissionError):
+            pass
+
+
+def pi_led_set_ready(ready: bool):
+    """Set LED state: True = green (ready to talk), False = red (thinking/speaking)."""
+    if not _PI_LED_OK:
+        return
+    if ready:
+        _pi_led_set(_PI_LED_GREEN, True)
+        _pi_led_set(_PI_LED_RED, False)
+    else:
+        _pi_led_set(_PI_LED_GREEN, False)
+        _pi_led_set(_PI_LED_RED, True)
 
 
 # ── Cleanup ───────────────────────────────────────────────────
 
 def cleanup():
-    """Terminate the microphone subprocess and restore Pi LED."""
-    _pi_led_set_running(False)
+    """Terminate the microphone subprocess, stop Ollama keepalive, and restore Pi LEDs."""
+    _ollama_stop_event.set()
+    _pi_led_restore()
     if _mic and _mic.poll() is None:
         _mic.terminate()
         try:
@@ -836,6 +949,48 @@ def on_signal(signum, frame):
 
 
 # ── Main ──────────────────────────────────────────────────────
+
+def _run_wake_word_loop():
+    """Main loop: wait for speech, check for wake word, route to LLM or quick commands."""
+    while True:
+        pi_led_set_ready(True)   # Green = listening
+        chunks = wait_for_speech()
+        if not chunks:
+            break
+        pi_led_set_ready(False)   # Red = thinking/speaking
+
+        save_wav(chunks, RAM_WAV)
+        text, dur = transcribe(RAM_WAV)
+        if VAD_DEBUG_SAVE:
+            _save_vad_debug(RAM_WAV, text)
+        try:
+            os.remove(RAM_WAV)
+        except OSError:
+            pass
+        if not text:
+            pi_led_set_ready(True)
+            continue
+        if dur < MIN_UTTERANCE_DURATION and match_quick_command(text) is None:
+            pi_led_set_ready(True)
+            continue
+
+        command = extract_wake_command(text)
+        if command is None:
+            pi_led_set_ready(True)
+            continue
+
+        if len(command) >= 2:
+            entered_conversation = ask_jarvis(text)
+        else:
+            speak("Yes?")
+            entered_conversation = True
+
+        if entered_conversation:
+            dbg(f"{GREEN}[CONVERSATION]{RESET} Active")
+            conversation()
+            wait_for_silence()
+            dbg(f"{YELLOW}[LISTENING]{RESET} Wake word mode")
+
 
 def main():
     global _mic
@@ -862,6 +1017,13 @@ def main():
     # Load TTS voice
     load_tts()
 
+    # Start Ollama keepalive (quick commands work without it; LLM needs connection)
+    global _ollama_connected
+    _ollama_connected = _check_ollama()
+    _ollama_stop_event.clear()
+    keepalive = threading.Thread(target=_ollama_keepalive_loop, daemon=True)
+    keepalive.start()
+
     # Start microphone
     _mic = subprocess.Popen(
         ["arecord", "-D", MIC_DEVICE, "-f", "S16_LE",
@@ -886,44 +1048,10 @@ def main():
 
     print(f"{GREEN}Jarvis ready.{RESET}\n")
 
-    _pi_led_set_running(True)  # Solid red PWR LED = Jarvis running (Pi only)
+    if _pi_led_init():
+        pi_led_set_ready(True)  # Green = ready to listen (Pi only, needs root)
 
-    # ── Wake-word loop ────────────────────────────────────────
-    while True:
-        chunks = wait_for_speech()
-        if not chunks:
-            break
-
-        save_wav(chunks, RAM_WAV)
-        text, dur = transcribe(RAM_WAV)
-        if VAD_DEBUG_SAVE:
-            _save_vad_debug(RAM_WAV, text)
-        try:
-            os.remove(RAM_WAV)
-        except OSError:
-            pass
-        if not text:
-            continue
-        # Skip very short captures unless they match a quick command
-        if dur < MIN_UTTERANCE_DURATION and match_quick_command(text) is None:
-            continue
-
-        command = extract_wake_command(text)
-        if command is None:
-            continue
-
-        if len(command) >= 2:
-            entered_conversation = ask_jarvis(text)
-        else:
-            speak("Yes?")
-            entered_conversation = True
-
-        # Conversation mode only when Jarvis gave a verbal reply (LLM or "Yes?")
-        if entered_conversation:
-            dbg(f"{GREEN}[CONVERSATION]{RESET} Active")
-            conversation()
-            wait_for_silence()
-            dbg(f"{YELLOW}[LISTENING]{RESET} Wake word mode")
+    _run_wake_word_loop()
 
 
 if __name__ == "__main__":

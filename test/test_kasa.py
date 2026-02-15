@@ -5,8 +5,9 @@ import asyncio
 import os
 import re
 
-# Load .env
-env_path = os.path.join(os.path.dirname(__file__), ".env")
+# Load .env from project root
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+env_path = os.path.join(_project_root, ".env")
 if os.path.exists(env_path):
     with open(env_path) as f:
         for line in f:

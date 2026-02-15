@@ -150,9 +150,11 @@ The service waits for network (Kasa, Ollama) and audio before starting, and rest
 
 ### Raspberry Pi LED Indicator
 
-When Jarvis is running, the red PWR LED stays **solid**. When Jarvis stops, the LED reverts to normal.
+- **Green** = ready to listen (say "Jarvis" to activate)
+- **Red** = thinking or speaking (wait until green to talk again)
+- On exit, both LEDs revert to normal
 
-**LED control requires root.** The service runs as your user for speaker/audio, so the LED won't change. Run `sudo ./run_jarvis.sh` manually if you want the red PWR LED solid while Jarvis runs.
+**LED control requires root.** Run `sudo ./run_jarvis.sh` for LED status. The systemd service runs as your user for audio, so the LED won't change unless the service is configured to run as root.
 
 ### Systemd: Disable, Restart, Reinstall
 
@@ -169,23 +171,22 @@ Key settings in `jarvis.py`:
 ```python
 # Wake word
 WAKE_WORD = "Jarvis"
-SIMILARITY_THRESHOLD = 0.7  # Wake word match threshold (0.0-1.0)
+SIMILARITY_THRESH = 0.6    # Wake word match threshold (0.0-1.0)
 
 # Audio
-THRESHOLD = 2000           # RMS threshold for VAD
-SILENCE_LIMIT = 2          # Seconds of silence to stop recording
-WAKE_CHUNK_DURATION = 2.5 # Seconds for wake word detection chunks
-
-# Whisper
-WHISPER_THREADS = "1"      # Number of threads for transcription
+THRESHOLD = 500            # RMS threshold for VAD (calibrate with calibrate_mic.py)
+SILENCE_LIMIT = 1.1        # Seconds of silence to stop recording
+SILENCE_LIMIT_CONV = 1.5   # Silence limit in conversation mode
 
 # Ollama
-PC_IP = "10.0.0.224"
-MODEL = "gemma3:12b"
+OLLAMA_IP = "10.0.0.224"
+OLLAMA_MODEL = "gemma3:12b"
 
 # TTS
-PIPER_VOICE_NAME = "en_US-lessac-medium"
+PIPER_VOICE = "en_US-ryan-high"
 ```
+
+Whisper uses auto thread count (up to 4). Use `calibrate_mic.py` to find the right THRESHOLD for your mic.
 
 ## Troubleshooting
 
@@ -201,7 +202,7 @@ PIPER_VOICE_NAME = "en_US-lessac-medium"
 ### Ollama Connection Failed
 - Verify Ollama is running on PC: `curl http://10.0.0.224:11434/api/tags`
 - Check firewall settings
-- Update `PC_IP` if different
+- Update `OLLAMA_IP` in jarvis.py if different
 
 ### Service Runs but No Audio
 The service runs as your user with `XDG_RUNTIME_DIR` for PipeWire. Ensure you're logged in (desktop session) when the service starts. If audio still fails, check `journalctl -u jarvis -f` for errors.
@@ -222,7 +223,7 @@ The service runs as your user with `XDG_RUNTIME_DIR` for PipeWire. Ensure you're
 - `run_jarvis.sh` - Wrapper script (auto-activates venv and runs jarvis.py)
 - `jarvis.service` - systemd unit for auto-start on boot
 - `install_service.sh` - Installs the systemd service
-- `jarvis_silent.py` - Console-only version (reference)
+- `test/jarvis_silent.py` - Console-only reference version (legacy)
 - `requirements.txt` - Python dependencies
 - `set_performance_mode.sh` - CPU performance mode script
 - `README.md` - This file
