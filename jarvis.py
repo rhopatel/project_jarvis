@@ -27,14 +27,15 @@ from typing import Optional
 DEBUG = 0  # 0 = clean (YOU/JARVIS only), 1 = verbose. Override: --debug or JARVIS_DEBUG=1
 VAD_DEBUG_SAVE     = 0            # 1 = save captured WAV to vad_captures/ (verify full command), 0 = off
 WAKE_WORD          = "Jarvis"
-SIMILARITY_THRESH = 0.75  # Wake word match; raise to cut false positives (georgis/jorgas fixed in _JARVIS_LIKE)
+SIMILARITY_THRESH = 0.65  # Wake word match; raise to cut false positives (georgis/jorgas fixed in _JARVIS_LIKE)
 THRESHOLD          = 700         # RMS threshold for voice activity detection (calibrated)
 SILENCE_LIMIT = 1.1         # seconds of silence to end utterance
 SILENCE_LIMIT_CONV = 1.0    # Shorter in conversation so "light on" etc. stop sooner → use tiny model
 PRE_AUDIO          = 0.4         # seconds of pre-roll (catch start of "Jarvis")
 CONVERSATION_TIMEOUT = 30        # seconds of no speech to exit conversation
 MIN_UTTERANCE_DURATION = 0.25     # seconds: ignore captures shorter than this (reduces false triggers like "you")
-# Barge-in (interrupt TTS): uncomment and implement in conversation() if needed
+# LLM: False = smart-home only (lights, desk, floor), no chat. True = full assistant.
+LLM_ENABLED        = False
 OLLAMA_IP          = "10.0.0.224"
 OLLAMA_MODEL       = "gemma3:12b"      # Best overall assistant
 RATE               = 16000
@@ -443,9 +444,11 @@ def _split_sentences(text: str) -> list:
 
 def speak(text: str):
     """Synthesise text with Piper and play via PulseAudio.
-    Sentence-by-sentence: play first sentence as soon as ready (low latency).
+    Only speaks when LLM is enabled and Ollama/GPU is reachable.
     """
     if not text or not text.strip():
+        return
+    if not LLM_ENABLED or not _ollama_connected:
         return
 
     from piper.config import SynthesisConfig
@@ -914,7 +917,9 @@ def ask_jarvis(text: str, dur: float = 0) -> bool:
             speak(err)
         return False
 
-    # No quick match → pass to LLM (short or long)
+    # No quick match → LLM if enabled, else silence
+    if not LLM_ENABLED:
+        return False
     print(f"{CYAN}YOU:{RESET} {text}")
     dbg(f"{YELLOW}[THINKING]{RESET}...")
     response = query_ollama(text, history=_chat_history)
@@ -1110,8 +1115,9 @@ def _run_wake_word_loop():
         if len(command) >= 2:
             entered_conversation = ask_jarvis(text, dur=dur)
         else:
+            # "Jarvis" alone: only enter conversation if LLM enabled
             speak("Yes?")
-            entered_conversation = True
+            entered_conversation = LLM_ENABLED
 
         if entered_conversation:
             dbg(f"{GREEN}[CONVERSATION]{RESET} Active")
